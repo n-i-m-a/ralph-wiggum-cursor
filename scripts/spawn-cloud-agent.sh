@@ -39,6 +39,45 @@ get_api_key() {
   return 1
 }
 
+get_github_token() {
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then echo "$GITHUB_TOKEN" && return 0; fi
+  if [[ -f "$CONFIG_FILE" ]]; then
+    TOKEN=$(jq -r '.github_token // empty' "$CONFIG_FILE" 2>/dev/null || echo "")
+    if [[ -n "$TOKEN" ]]; then echo "$TOKEN" && return 0; fi
+  fi
+  if [[ -f "$GLOBAL_CONFIG" ]]; then
+    TOKEN=$(jq -r '.github_token // empty' "$GLOBAL_CONFIG" 2>/dev/null || echo "")
+    if [[ -n "$TOKEN" ]]; then echo "$TOKEN" && return 0; fi
+  fi
+  return 1
+}
+
+git_push_with_token() {
+  local branch="$1"
+  local force="${2:-}"
+  
+  GH_TOKEN=$(get_github_token) || GH_TOKEN=""
+  
+  if [[ -n "$GH_TOKEN" ]]; then
+    # Use token for authentication
+    REPO_URL=$(git remote get-url origin 2>/dev/null)
+    # Convert to https with token
+    TOKEN_URL=$(echo "$REPO_URL" | sed "s|https://github.com/|https://$GH_TOKEN@github.com/|" | sed "s|git@github.com:|https://$GH_TOKEN@github.com/|")
+    if [[ -n "$force" ]]; then
+      git push "$TOKEN_URL" "$branch" --force 2>/dev/null
+    else
+      git push "$TOKEN_URL" "$branch" 2>/dev/null
+    fi
+  else
+    # Fall back to default git push
+    if [[ -n "$force" ]]; then
+      git push origin "$branch" --force 2>/dev/null
+    else
+      git push origin "$branch" 2>/dev/null
+    fi
+  fi
+}
+
 get_repo_url() {
   (cd "$WORKSPACE_ROOT" && git remote get-url origin 2>/dev/null | sed 's/\.git$//' | sed 's|git@github.com:|https://github.com/|')
 }
@@ -77,7 +116,7 @@ main() {
     git add -A
     git commit -m "ralph: iteration $CURRENT_ITERATION checkpoint (cloud handoff)" || true
     
-    if ! git push origin "$CURRENT_BRANCH" --force 2>/dev/null; then
+    if ! git_push_with_token "$CURRENT_BRANCH" "force"; then
       echo "⚠️  Could not push. Cloud Agent may not see latest changes." >&2
     fi
   else
@@ -187,7 +226,7 @@ EOF
       cd "$WORKSPACE_ROOT"
       git add .ralph/ 2>/dev/null || true
       git commit -m "ralph: sync state for cloud agent iteration $NEXT_ITERATION" 2>/dev/null || true
-      git push origin "$CURRENT_BRANCH" --force 2>/dev/null || true
+      git_push_with_token "$CURRENT_BRANCH" "force" || true
     fi
     
     return 0
