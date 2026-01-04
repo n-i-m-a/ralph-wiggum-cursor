@@ -24,7 +24,8 @@ if [[ "$WORKSPACE_ROOT" == "." ]] || [[ -z "$WORKSPACE_ROOT" ]]; then
   if [[ -f "./RALPH_TASK.md" ]]; then
     WORKSPACE_ROOT="$(pwd)"
   else
-    echo '{}'
+    # No Ralph task - allow prompt to continue
+    echo '{"continue": true}'
     exit 0
   fi
 fi
@@ -33,7 +34,8 @@ TASK_FILE="$WORKSPACE_ROOT/RALPH_TASK.md"
 
 # Check if Ralph is active (task file exists)
 if [[ ! -f "$TASK_FILE" ]]; then
-  echo '{}'
+  # No Ralph task - allow prompt to continue
+  echo '{"continue": true}'
   exit 0
 fi
 
@@ -185,9 +187,11 @@ AGENT_MSG="$AGENT_MSG
 
 $GUARDRAILS"
 
+# Output: continue=true + agent_message (undocumented but works for injecting context)
 jq -n \
   --arg msg "$AGENT_MSG" \
   '{
+    "continue": true,
     "agent_message": $msg
   }'
 

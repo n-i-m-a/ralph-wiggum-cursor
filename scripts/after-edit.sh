@@ -32,6 +32,12 @@ if [[ ! -d "$EXT_DIR" ]]; then
   exit 0
 fi
 
+# Skip processing if agent is being terminated (mid-handoff)
+if is_terminated "$EXT_DIR"; then
+  echo '{}'
+  exit 0
+fi
+
 # Get current iteration
 CURRENT_ITERATION=$(get_iteration "$EXT_DIR")
 
