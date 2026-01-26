@@ -467,8 +467,10 @@ run_parallel_tasks() {
   # =========================================================================
   # PREFLIGHT CHECK: Ensure RALPH_TASK.md is tracked
   # =========================================================================
-  # Parallel mode copies RALPH_TASK.md to worktrees. If it's untracked on the
-  # base branch, worktrees won't have it and agents will fail.
+  # Parallel mode requires RALPH_TASK.md to be committed so that:
+  # - Merges are deterministic (no "untracked file would be overwritten" errors)
+  # - Reruns are reproducible (agents start from same baseline)
+  # - Checkbox updates commit cleanly to the integration branch
   
   local untracked_files
   untracked_files=$(git -C "$original_dir" status --porcelain -- "RALPH_TASK.md" 2>/dev/null | grep '^??' || true)
@@ -477,7 +479,7 @@ run_parallel_tasks() {
     echo ""
     echo "❌ RALPH_TASK.md is untracked (not committed to git)."
     echo ""
-    echo "   Parallel mode requires RALPH_TASK.md to be committed so worktrees can access it."
+    echo "   Parallel mode requires RALPH_TASK.md to be committed so merges and reruns are deterministic."
     echo ""
     echo "   To fix, run:"
     echo ""
