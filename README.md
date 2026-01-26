@@ -139,6 +139,13 @@ With gum, you get a beautiful interactive menu for selecting models and options:
   ◯ Run single iteration first
   ◯ Work on new branch
   ◯ Open PR when complete
+  ◯ Run in parallel mode         ← runs multiple agents concurrently
+```
+
+If you select "Run in parallel mode", you'll be prompted for:
+
+```
+? Max parallel agents: 3         ← default is 3, enter any number
 ```
 
 Without gum, Ralph falls back to simple numbered prompts.
@@ -245,18 +252,33 @@ Options:
 
 ## Parallel Execution
 
-Ralph can run multiple agents concurrently, each in an isolated git worktree:
+Ralph can run multiple agents concurrently, each in an isolated git worktree.
 
+### Starting Parallel Mode
+
+**Via gum UI (interactive):**
+```bash
+./ralph-setup.sh
+# Select "Run in parallel mode" in options
+# Enter number of agents when prompted (default: 3, no upper limit)
+```
+
+**Via CLI (scripting/CI):**
 ```bash
 # Run 3 agents in parallel (default)
 ./ralph-loop.sh --parallel
 
-# Run 5 agents in parallel
-./ralph-loop.sh --parallel --max-parallel 5
+# Run 10 agents in parallel (no hard cap)
+./ralph-loop.sh --parallel --max-parallel 10
 
 # Keep branches separate (no auto-merge)
 ./ralph-loop.sh --parallel --no-merge
+
+# Combine with branch workflow
+./ralph-loop.sh --parallel --max-parallel 5 --branch feature/multi-task
 ```
+
+> **Note:** There's no hard limit on `--max-parallel`. The practical limit depends on your machine's resources and API rate limits.
 
 ### How Parallel Mode Works
 
@@ -296,16 +318,29 @@ Ralph can run multiple agents concurrently, each in an isolated git worktree:
 - No interference between agents working on different tasks
 - Branches auto-merge after completion (or keep separate with `--no-merge`)
 - Conflict detection and reporting
+- Tasks are processed in batches (e.g., 5 agents = 5 tasks per batch)
+
+**When to use parallel mode:**
+- Multiple independent tasks that don't conflict
+- Large task lists you want completed faster
+- CI/CD pipelines with parallelization budget
+
+**When to use sequential mode:**
+- Tasks that depend on each other
+- Single complex task that needs focused attention
+- Limited API rate limits
 
 **Worktree structure:**
 ```
 project/
-├── .ralph-worktrees/           # Temporary worktrees
+├── .ralph-worktrees/           # Temporary worktrees (auto-cleaned)
 │   ├── agent-1-abc123/         # Agent 1's isolated copy
 │   ├── agent-2-def456/         # Agent 2's isolated copy
 │   └── agent-3-ghi789/         # Agent 3's isolated copy
 └── (original project files)
 ```
+
+Worktrees are automatically cleaned up after agents complete. Failed agents preserve their worktree for manual inspection.
 
 ## How It Works
 
