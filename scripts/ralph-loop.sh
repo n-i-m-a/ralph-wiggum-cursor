@@ -18,6 +18,9 @@
 #   -m, --model MODEL      Model to use (default: opus-4.5-thinking)
 #   --branch NAME          Create and work on a new branch
 #   --pr                   Open PR when complete (requires --branch)
+#   --parallel             Run tasks in parallel with worktrees
+#   --max-parallel N       Max parallel agents (default: 3)
+#   --no-merge             Skip auto-merge in parallel mode
 #   -y, --yes              Skip confirmation prompt
 #   -h, --help             Show this help
 #
@@ -32,6 +35,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source common functions
 source "$SCRIPT_DIR/ralph-common.sh"
+source "$SCRIPT_DIR/task-parser.sh"
+
+# Source parallel execution (if available)
+if [[ -f "$SCRIPT_DIR/ralph-parallel.sh" ]]; then
+  source "$SCRIPT_DIR/ralph-parallel.sh"
+fi
 
 # =============================================================================
 # FLAG PARSING
@@ -49,6 +58,9 @@ Options:
   -m, --model MODEL      Model to use (default: opus-4.5-thinking)
   --branch NAME          Create and work on a new branch
   --pr                   Open PR when complete (requires --branch)
+  --parallel             Run tasks in parallel with worktrees
+  --max-parallel N       Max parallel agents (default: 3)
+  --no-merge             Skip auto-merge in parallel mode
   -y, --yes              Skip confirmation prompt
   -h, --help             Show this help
 
@@ -57,6 +69,7 @@ Examples:
   ./ralph-loop.sh -n 50                              # 50 iterations max
   ./ralph-loop.sh -m gpt-5.2-high                    # Use GPT model
   ./ralph-loop.sh --branch feature/api --pr -y      # Scripted PR workflow
+  ./ralph-loop.sh --parallel --max-parallel 4        # Run 4 agents in parallel
   
 Environment:
   RALPH_MODEL            Override default model (same as -m flag)
@@ -64,6 +77,11 @@ Environment:
 For interactive setup with a beautiful UI, use ralph-setup.sh instead.
 EOF
 }
+
+# Parallel mode settings
+PARALLEL_MODE=false
+MAX_PARALLEL=3
+SKIP_MERGE=false
 
 # Parse command line arguments
 WORKSPACE=""
@@ -84,6 +102,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --pr)
       OPEN_PR=true
+      shift
+      ;;
+    --parallel)
+      PARALLEL_MODE=true
+      shift
+      ;;
+    --max-parallel)
+      MAX_PARALLEL="$2"
+      PARALLEL_MODE=true
+      shift 2
+      ;;
+    --no-merge)
+      SKIP_MERGE=true
       shift
       ;;
     -y|--yes)
@@ -164,6 +195,8 @@ main() {
   echo "Max iter: $MAX_ITERATIONS"
   [[ -n "$USE_BRANCH" ]] && echo "Branch:   $USE_BRANCH"
   [[ "$OPEN_PR" == "true" ]] && echo "Open PR:  Yes"
+  [[ "$PARALLEL_MODE" == "true" ]] && echo "Parallel: Yes ($MAX_PARALLEL agents)"
+  [[ "$SKIP_MERGE" == "true" ]] && echo "Merge:    Skipped"
   echo ""
   
   if [[ "$remaining" -eq 0 ]] && [[ "$total_criteria" -gt 0 ]]; then
@@ -188,9 +221,25 @@ main() {
     fi
   fi
   
-  # Run the loop
-  run_ralph_loop "$WORKSPACE" "$SCRIPT_DIR"
-  exit $?
+  # Run in parallel or sequential mode
+  if [[ "$PARALLEL_MODE" == "true" ]]; then
+    # Check if parallel functions are available
+    if ! type run_parallel_tasks &>/dev/null; then
+      echo "❌ Parallel execution not available (ralph-parallel.sh not found)"
+      exit 1
+    fi
+    
+    # Export settings for parallel execution
+    export MODEL
+    export SKIP_MERGE
+    
+    run_parallel_tasks "$WORKSPACE" "$MAX_PARALLEL" "$USE_BRANCH"
+    exit $?
+  else
+    # Run the sequential loop
+    run_ralph_loop "$WORKSPACE" "$SCRIPT_DIR"
+    exit $?
+  fi
 }
 
 main

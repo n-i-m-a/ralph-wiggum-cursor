@@ -100,6 +100,7 @@ your-project/
 │   ├── ralph-setup.sh          # Main entry point (interactive)
 │   ├── ralph-loop.sh           # CLI mode (for scripting)
 │   ├── ralph-once.sh           # Single iteration (testing)
+│   ├── ralph-parallel.sh       # Parallel execution with worktrees
 │   ├── stream-parser.sh        # Token tracking + error detection
 │   ├── ralph-common.sh         # Shared functions
 │   ├── ralph-retry.sh          # Exponential backoff retry logic
@@ -111,6 +112,7 @@ your-project/
 │   ├── activity.log            # Tool call log (parser writes)
 │   ├── errors.log              # Failure log (parser writes)
 │   └── tasks.yaml              # Cached task state (auto-generated)
+├── .ralph-worktrees/           # Temporary (parallel mode only)
 └── RALPH_TASK.md               # Your task definition
 ```
 
@@ -219,6 +221,9 @@ Options:
   -m, --model MODEL      Model to use (default: opus-4.5-thinking)
   --branch NAME          Create and work on a new branch
   --pr                   Open PR when complete (requires --branch)
+  --parallel             Run tasks in parallel with worktrees
+  --max-parallel N       Max parallel agents (default: 3)
+  --no-merge             Skip auto-merge in parallel mode
   -y, --yes              Skip confirmation prompt
 ```
 
@@ -230,6 +235,76 @@ Options:
 
 # Use a different model with more iterations
 ./ralph-loop.sh -n 50 -m gpt-5.2-high
+
+# Run 4 agents in parallel
+./ralph-loop.sh --parallel --max-parallel 4
+
+# Parallel with branches (no auto-merge)
+./ralph-loop.sh --parallel --no-merge
+```
+
+## Parallel Execution
+
+Ralph can run multiple agents concurrently, each in an isolated git worktree:
+
+```bash
+# Run 3 agents in parallel (default)
+./ralph-loop.sh --parallel
+
+# Run 5 agents in parallel
+./ralph-loop.sh --parallel --max-parallel 5
+
+# Keep branches separate (no auto-merge)
+./ralph-loop.sh --parallel --no-merge
+```
+
+### How Parallel Mode Works
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    Parallel Execution Flow                      │
+├────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  RALPH_TASK.md                                                  │
+│  - [ ] Task A                                                    │
+│  - [ ] Task B           ┌──────────────────────────┐            │
+│  - [ ] Task C     ───▶  │   Create Worktrees       │            │
+│                         └──────────────────────────┘            │
+│                                    │                             │
+│                    ┌───────────────┼───────────────┐            │
+│                    ▼               ▼               ▼            │
+│              ┌──────────┐   ┌──────────┐   ┌──────────┐         │
+│              │ Agent 1  │   │ Agent 2  │   │ Agent 3  │         │
+│              │ worktree │   │ worktree │   │ worktree │         │
+│              │  Task A  │   │  Task B  │   │  Task C  │         │
+│              └────┬─────┘   └────┬─────┘   └────┬─────┘         │
+│                   │              │              │                │
+│                   ▼              ▼              ▼                │
+│              branch-a       branch-b       branch-c              │
+│                   │              │              │                │
+│                   └──────────────┼──────────────┘                │
+│                                  ▼                               │
+│                         ┌──────────────┐                        │
+│                         │  Auto-Merge  │                        │
+│                         │  to base     │                        │
+│                         └──────────────┘                        │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Key benefits:**
+- Each agent works in complete isolation (separate git worktree)
+- No interference between agents working on different tasks
+- Branches auto-merge after completion (or keep separate with `--no-merge`)
+- Conflict detection and reporting
+
+**Worktree structure:**
+```
+project/
+├── .ralph-worktrees/           # Temporary worktrees
+│   ├── agent-1-abc123/         # Agent 1's isolated copy
+│   ├── agent-2-def456/         # Agent 2's isolated copy
+│   └── agent-3-ghi789/         # Agent 3's isolated copy
+└── (original project files)
 ```
 
 ## How It Works
