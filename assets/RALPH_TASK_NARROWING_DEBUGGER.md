@@ -1,6 +1,6 @@
 ---
 task: Build "ts-narrow" - A TypeScript Type Narrowing Debugger
-test_command: "npm test"
+test_command: "pnpm test"
 completion_criteria:
   - CLI parses TypeScript files
   - Tracks type of a variable through control flow
@@ -237,17 +237,17 @@ ts-narrow/
 - Must use TypeScript Compiler API (not regex/string parsing)
 - No external dependencies except `typescript`
 - **Tests must assert on exact expected outputs**
-- **Task is NOT complete until `npm test` exits with code 0**
+- **Task is NOT complete until `pnpm test` exits with code 0**
 
 ---
 
 ## Ralph Instructions
 
 1. Work through phases in order
-2. **Run `npm test` after EVERY change**
+2. **Run `pnpm test` after EVERY change**
 3. If tests fail, read the failure message and fix the code
 4. A criterion is only complete when relevant tests pass
 5. Commit after completing each criterion
 6. **Criterion 17 is CRITICAL** - the final type must reflect narrowing scope
-7. When ALL criteria are [x] AND `npm test` passes: `<ralph>COMPLETE</ralph>`
+7. When ALL criteria are [x] AND `pnpm test` passes: `<ralph>COMPLETE</ralph>`
 8. If stuck on same issue 3+ times: `<ralph>GUTTER</ralph>`

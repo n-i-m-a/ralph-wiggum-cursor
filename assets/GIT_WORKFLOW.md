@@ -43,7 +43,7 @@ The process is a loop of local work, automated handoff, cloud-based work, and ma
 
     1.  **Fetch the changes**: `git fetch origin`
     2.  **Check out the agent's branch**: `git checkout ralph-iteration-1`
-    3.  **Review the work**: Examine the commits and the code changes made by the agent. Run tests (`npm test`) to ensure everything is working as expected.
+    3.  **Review the work**: Examine the commits and the code changes made by the agent. Run tests (`pnpm test`) to ensure everything is working as expected.
     4.  **Switch back to `main`**: `git checkout main`
     5.  **Merge the changes**: `git merge --squash ralph-iteration-1`
 

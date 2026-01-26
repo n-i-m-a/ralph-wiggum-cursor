@@ -5,6 +5,21 @@
 # All state lives in .ralph/ within the project.
 
 # =============================================================================
+# SOURCE DEPENDENCIES
+# =============================================================================
+
+# Get the directory where this script lives
+_RALPH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source the task parser for YAML backend support
+if [[ -f "$_RALPH_SCRIPT_DIR/task-parser.sh" ]]; then
+  source "$_RALPH_SCRIPT_DIR/task-parser.sh"
+  _TASK_PARSER_AVAILABLE=1
+else
+  _TASK_PARSER_AVAILABLE=0
+fi
+
+# =============================================================================
 # CONFIGURATION (can be overridden before sourcing)
 # =============================================================================
 
@@ -23,6 +38,16 @@ MODEL="${RALPH_MODEL:-$DEFAULT_MODEL}"
 USE_BRANCH="${USE_BRANCH:-}"
 OPEN_PR="${OPEN_PR:-false}"
 SKIP_CONFIRM="${SKIP_CONFIRM:-false}"
+
+# =============================================================================
+# SOURCE RETRY UTILITIES
+# =============================================================================
+
+# Source retry logic utilities
+SCRIPT_DIR="${SCRIPT_DIR:-$(dirname "${BASH_SOURCE[0]}")}"
+if [[ -f "$SCRIPT_DIR/ralph-retry.sh" ]]; then
+  source "$SCRIPT_DIR/ralph-retry.sh"
+fi
 
 # =============================================================================
 # BASIC HELPERS
@@ -208,6 +233,7 @@ EOF
 # =============================================================================
 
 # Check if task is complete
+# Uses task-parser.sh when available for cached/YAML support
 check_task_complete() {
   local workspace="$1"
   local task_file="$workspace/RALPH_TASK.md"
@@ -216,6 +242,29 @@ check_task_complete() {
     echo "NO_TASK_FILE"
     return
   fi
+  
+  # Use task parser if available (provides caching)
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
+    local remaining
+    remaining=$(count_remaining "$workspace" 2>/dev/null) || remaining=-1
+    
+    if [[ "$remaining" -eq 0 ]]; then
+      echo "COMPLETE"
+    elif [[ "$remaining" -gt 0 ]]; then
+      echo "INCOMPLETE:$remaining"
+    else
+      # Fallback to direct grep if parser fails
+      _check_task_complete_direct "$workspace"
+    fi
+  else
+    _check_task_complete_direct "$workspace"
+  fi
+}
+
+# Direct task completion check (fallback)
+_check_task_complete_direct() {
+  local workspace="$1"
+  local task_file="$workspace/RALPH_TASK.md"
   
   # Only count actual checkbox list items, not [ ] in prose/examples
   # Matches: "- [ ]", "* [ ]", "1. [ ]", etc.
@@ -230,6 +279,7 @@ check_task_complete() {
 }
 
 # Count task criteria (returns done:total)
+# Uses task-parser.sh when available for cached/YAML support
 count_criteria() {
   local workspace="${1:-.}"
   local task_file="$workspace/RALPH_TASK.md"
@@ -239,6 +289,27 @@ count_criteria() {
     return
   fi
   
+  # Use task parser if available (provides caching)
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
+    local progress
+    progress=$(get_progress "$workspace" 2>/dev/null) || progress=""
+    
+    if [[ -n "$progress" ]] && [[ "$progress" =~ ^[0-9]+:[0-9]+$ ]]; then
+      echo "$progress"
+    else
+      # Fallback to direct grep if parser fails
+      _count_criteria_direct "$workspace"
+    fi
+  else
+    _count_criteria_direct "$workspace"
+  fi
+}
+
+# Direct criteria counting (fallback)
+_count_criteria_direct() {
+  local workspace="${1:-.}"
+  local task_file="$workspace/RALPH_TASK.md"
+  
   # Only count actual checkbox list items, not [x] or [ ] in prose/examples
   # Matches: "- [ ]", "* [x]", "1. [ ]", etc.
   local total done_count
@@ -246,6 +317,60 @@ count_criteria() {
   done_count=$(grep -cE '^[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+\[x\]' "$task_file" 2>/dev/null) || done_count=0
   
   echo "$done_count:$total"
+}
+
+# =============================================================================
+# TASK PARSER CONVENIENCE WRAPPERS
+# =============================================================================
+
+# Get the next task to work on (wrapper for task-parser.sh)
+# Returns: task_id|status|description or empty
+get_next_task_info() {
+  local workspace="${1:-.}"
+  
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
+    get_next_task "$workspace"
+  else
+    echo ""
+  fi
+}
+
+# Mark a specific task complete by line-based ID
+# Usage: complete_task "$workspace" "line_15"
+complete_task() {
+  local workspace="${1:-.}"
+  local task_id="$2"
+  
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
+    mark_task_complete "$workspace" "$task_id"
+  else
+    echo "ERROR: Task parser not available" >&2
+    return 1
+  fi
+}
+
+# List all tasks with their status
+# Usage: list_all_tasks "$workspace"
+list_all_tasks() {
+  local workspace="${1:-.}"
+  
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
+    get_all_tasks "$workspace"
+  else
+    echo "ERROR: Task parser not available" >&2
+    return 1
+  fi
+}
+
+# Refresh task cache (useful after external edits)
+refresh_task_cache() {
+  local workspace="${1:-.}"
+  
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
+    # Invalidate and re-parse
+    rm -f "$workspace/.ralph/$TASK_MTIME_FILE" 2>/dev/null
+    parse_tasks "$workspace"
+  fi
 }
 
 # =============================================================================
@@ -275,7 +400,7 @@ Before doing anything:
 You are already in a git repository. Work HERE, not in a subdirectory:
 
 - Do NOT run \`git init\` - the repo already exists
-- Do NOT run scaffolding commands that create nested directories (\`npx create-*\`, \`npm init\`, etc.)
+- Do NOT run scaffolding commands that create nested directories (\`npx create-*\`, \`pnpm init\`, etc.)
 - If you need to scaffold, use flags like \`--no-git\` or scaffold into the current directory (\`.\`)
 - All code should live at the repo root or in subdirectories you create manually
 
@@ -430,6 +555,13 @@ run_iteration() {
         signal="COMPLETE"
         # Let agent finish gracefully
         ;;
+      "DEFER")
+        printf "\r\033[K" >&2  # Clear spinner line
+        echo "⏸️  Rate limit or transient error - deferring for retry..." >&2
+        signal="DEFER"
+        # Stop the agent, will retry with backoff
+        kill $agent_pid 2>/dev/null || true
+        ;;
     esac
   done < "$fifo"
   
@@ -567,6 +699,26 @@ run_ralph_loop() {
         echo "   3. Re-run the loop"
         return 1
         ;;
+      "DEFER")
+        # Rate limit or transient error - wait with exponential backoff then retry
+        log_progress "$workspace" "**Session $iteration ended** - ⏸️ DEFERRED (rate limit/transient error)"
+        
+        # Calculate backoff delay (uses ralph-retry.sh functions if available)
+        local defer_delay=30
+        if type calculate_backoff_delay &>/dev/null; then
+          local defer_attempt=${DEFER_COUNT:-1}
+          DEFER_COUNT=$((defer_attempt + 1))
+          defer_delay=$(($(calculate_backoff_delay "$defer_attempt" 15 120 true) / 1000))
+        fi
+        
+        echo ""
+        echo "⏸️  Rate limit or transient error detected."
+        echo "   Waiting ${defer_delay}s before retrying (attempt ${DEFER_COUNT:-1})..."
+        sleep "$defer_delay"
+        
+        # Don't increment iteration - retry the same task
+        echo "   Resuming..."
+        ;;
       *)
         # Agent finished naturally, check if more work needed
         if [[ "$task_status" == INCOMPLETE:* ]]; then
@@ -608,7 +760,7 @@ check_prerequisites() {
     echo "  cat > RALPH_TASK.md << 'EOF'"
     echo "  ---"
     echo "  task: Your task description"
-    echo "  test_command: \"npm test\""
+    echo "  test_command: \"pnpm test\""
     echo "  ---"
     echo "  # Task"
     echo "  ## Success Criteria"

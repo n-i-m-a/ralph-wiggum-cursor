@@ -58,9 +58,11 @@ This creates two problems:
 │  ├── activity.log  (tool calls)            ├── WARN at 70k  │
 │  ├── errors.log    (failures)              ├── ROTATE at 80k│
 │  ├── progress.md   (agent writes)          ├── COMPLETE     │
-│  └── guardrails.md (lessons learned)       └── GUTTER       │
+│  ├── guardrails.md (lessons learned)       ├── GUTTER       │
+│  └── tasks.yaml    (cached task state)     └── DEFER        │
 │                                                              │
 │  When ROTATE → fresh context, continue from git             │
+│  When DEFER → exponential backoff, retry same task          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,6 +70,8 @@ This creates two problems:
 - **Interactive setup** - Beautiful gum-based UI for model selection and options
 - **Accurate token tracking** - Parser counts actual bytes from every file read/write
 - **Gutter detection** - Detects when agent is stuck (same command failed 3x, file thrashing)
+- **Rate limit handling** - Detects rate limits/network errors, waits with exponential backoff
+- **Task caching** - YAML backend with mtime invalidation for efficient task parsing
 - **Learning from failures** - Agent updates `.ralph/guardrails.md` with lessons
 - **State in git** - Commits frequently so next agent picks up from git history
 - **Branch/PR workflow** - Optionally work on a branch and open PR when complete
@@ -96,14 +100,17 @@ your-project/
 │   ├── ralph-setup.sh          # Main entry point (interactive)
 │   ├── ralph-loop.sh           # CLI mode (for scripting)
 │   ├── ralph-once.sh           # Single iteration (testing)
-│   ├── stream-parser.sh        # Token tracking
+│   ├── stream-parser.sh        # Token tracking + error detection
 │   ├── ralph-common.sh         # Shared functions
+│   ├── ralph-retry.sh          # Exponential backoff retry logic
+│   ├── task-parser.sh          # YAML-backed task parsing
 │   └── init-ralph.sh           # Re-initialize if needed
 ├── .ralph/                     # State files (tracked in git)
 │   ├── progress.md             # Agent updates: what's done
 │   ├── guardrails.md           # Lessons learned (Signs)
 │   ├── activity.log            # Tool call log (parser writes)
-│   └── errors.log              # Failure log (parser writes)
+│   ├── errors.log              # Failure log (parser writes)
+│   └── tasks.yaml              # Cached task state (auto-generated)
 └── RALPH_TASK.md               # Your task definition
 ```
 
@@ -141,7 +148,7 @@ Edit `RALPH_TASK.md`:
 ```markdown
 ---
 task: Build a REST API
-test_command: "npm test"
+test_command: "pnpm test"
 ---
 
 # Task: REST API
@@ -186,7 +193,7 @@ tail -f .ralph/activity.log
 # Example output:
 # [12:34:56] 🟢 READ src/index.ts (245 lines, ~24.5KB)
 # [12:34:58] 🟢 WRITE src/routes/users.ts (50 lines, 2.1KB)
-# [12:35:01] 🟢 SHELL npm test → exit 0
+# [12:35:01] 🟢 SHELL pnpm test → exit 0
 # [12:35:10] 🟢 TOKENS: 45,230 / 80,000 (56%) [read:30KB write:5KB assist:10KB shell:0KB]
 
 # Check for failures
@@ -319,6 +326,29 @@ When gutter is detected:
 2. Fix the issue manually or add a guardrail
 3. Re-run the loop
 
+## Rate Limit & Transient Error Handling
+
+The parser detects retryable API errors and handles them gracefully:
+
+| Error Type | Examples | What Happens |
+|------------|----------|--------------|
+| Rate limits | 429, "rate limit exceeded", "quota" | DEFER signal |
+| Network errors | timeout, connection reset, ECONNRESET | DEFER signal |
+| Server errors | 502, 503, 504, "service unavailable" | DEFER signal |
+
+When DEFER is triggered:
+1. Agent stops current iteration
+2. Waits with **exponential backoff** (15s base, doubles each retry, max 120s)
+3. Adds jitter (0-25%) to prevent thundering herd
+4. Retries the same task (does not increment iteration)
+
+Example log:
+```
+⏸️  Rate limit or transient error detected.
+   Waiting 32s before retrying (attempt 2)...
+   Resuming...
+```
+
 ## Completion Detection
 
 Ralph detects completion in two ways:
@@ -337,6 +367,8 @@ Both are verified before declaring success.
 | `.ralph/guardrails.md` | Lessons learned (Signs) | Agent reads first, writes after failures |
 | `.ralph/activity.log` | Tool call log with token counts | Parser writes, you monitor |
 | `.ralph/errors.log` | Failures + gutter detection | Parser writes, agent reads |
+| `.ralph/tasks.yaml` | Cached task state (auto-generated) | Task parser writes/reads |
+| `.ralph/tasks.mtime` | Task file modification time | Cache invalidation |
 | `.ralph/.iteration` | Current iteration number | Parser reads/writes |
 
 ## Configuration

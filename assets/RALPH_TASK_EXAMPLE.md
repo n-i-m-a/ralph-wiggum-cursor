@@ -1,6 +1,6 @@
 ---
 task: Build a REST API for task management
-test_command: "npm test"
+test_command: "pnpm test"
 completion_criteria:
   - All CRUD endpoints working and tested
   - Input validation implemented
@@ -65,14 +65,14 @@ Build a simple but production-ready REST API for managing tasks (todo items). Th
 
 The task is complete when ALL of the following are true:
 
-1. [ ] `npm start` runs the server without errors
+1. [ ] `pnpm start` runs the server without errors
 2. [ ] POST /tasks implemented (validation + tests)
 3. [ ] GET /tasks implemented (pagination/filtering + tests)
 4. [ ] GET /tasks/:id implemented (404 + tests)
 5. [ ] PUT /tasks/:id implemented (validation + 404 + tests)
 6. [ ] PATCH /tasks/:id/complete implemented (tests)
 7. [ ] DELETE /tasks/:id implemented (404 + tests)
-8. [ ] Test coverage > 80% (run `npm test -- --coverage`)
+8. [ ] Test coverage > 80% (run `pnpm test -- --coverage`)
 9. [ ] README.md documents all endpoints with examples
 
 ## Technical Notes

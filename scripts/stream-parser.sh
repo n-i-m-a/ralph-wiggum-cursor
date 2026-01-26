@@ -102,6 +102,39 @@ log_token_status() {
   echo "[$timestamp] $emoji $status_msg $breakdown" >> "$RALPH_DIR/activity.log"
 }
 
+# Check if an error message indicates a retryable API error
+# Returns: 0 if retryable (should defer), 1 if not retryable
+is_retryable_api_error() {
+  local error_msg="$1"
+  local lower_msg
+  lower_msg=$(echo "$error_msg" | tr '[:upper:]' '[:lower:]')
+  
+  # Rate limit patterns
+  if [[ "$lower_msg" =~ (rate[[:space:]]*limit|rate_limit|rate-limit) ]] || \
+     [[ "$lower_msg" =~ (quota[[:space:]]*exceeded|quota[[:space:]]*limit|hit[[:space:]]*your[[:space:]]*limit) ]] || \
+     [[ "$lower_msg" =~ (too[[:space:]]*many[[:space:]]*requests|429|http[[:space:]]*429) ]]; then
+    return 0
+  fi
+  
+  # Network/connection patterns
+  if [[ "$lower_msg" =~ (timeout|timed[[:space:]]*out|connection[[:space:]]*timeout) ]] || \
+     [[ "$lower_msg" =~ (network[[:space:]]*error|network[[:space:]]*unavailable) ]] || \
+     [[ "$lower_msg" =~ (connection[[:space:]]*refused|connection[[:space:]]*reset|econnreset) ]] || \
+     [[ "$lower_msg" =~ (connection[[:space:]]*closed|connection[[:space:]]*failed|etimedout|enotfound) ]]; then
+    return 0
+  fi
+  
+  # Server error patterns
+  if [[ "$lower_msg" =~ (service[[:space:]]*unavailable|503) ]] || \
+     [[ "$lower_msg" =~ (bad[[:space:]]*gateway|502) ]] || \
+     [[ "$lower_msg" =~ (gateway[[:space:]]*timeout|504) ]] || \
+     [[ "$lower_msg" =~ (overloaded|server[[:space:]]*busy|try[[:space:]]*again) ]]; then
+    return 0
+  fi
+  
+  return 1  # Not retryable
+}
+
 # Check for gutter conditions
 check_gutter() {
   local tokens=$(calc_tokens)
@@ -180,6 +213,24 @@ process_line() {
       if [[ "$subtype" == "init" ]]; then
         local model=$(echo "$line" | jq -r '.model // "unknown"' 2>/dev/null) || model="unknown"
         log_activity "SESSION START: model=$model"
+      fi
+      ;;
+    
+    "error")
+      # Handle API/engine errors
+      local error_msg
+      error_msg=$(echo "$line" | jq -r '.error.data.message // .error.message // .message // "Unknown error"' 2>/dev/null) || error_msg="Unknown error"
+      
+      log_error "API ERROR: $error_msg"
+      log_activity "❌ API ERROR: $error_msg"
+      
+      # Check if this is a retryable error (rate limit, network, etc.)
+      if is_retryable_api_error "$error_msg"; then
+        log_error "⚠️ RETRYABLE: Error may be transient (rate limit/network)"
+        echo "DEFER" 2>/dev/null || true
+      else
+        log_error "🚨 NON-RETRYABLE: Error requires attention"
+        echo "GUTTER" 2>/dev/null || true
       fi
       ;;
       

@@ -47,7 +47,7 @@ if [[ ! -f "RALPH_TASK.md" ]]; then
     cat > RALPH_TASK.md << 'EOF'
 ---
 task: Your task description here
-test_command: "npm test"
+test_command: "pnpm test"
 ---
 
 # Task
