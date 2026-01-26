@@ -35,9 +35,24 @@ max_iterations: 50
 
 The task is complete when ALL of the following are true:
 
-1. [ ] [Verifiable criterion 1]
-2. [ ] [Verifiable criterion 2]
-3. [ ] [Verifiable criterion 3]
+1. [ ] [Verifiable criterion 1] <!-- group: 1 -->
+2. [ ] [Verifiable criterion 2] <!-- group: 1 -->
+3. [ ] [Verifiable criterion 3] <!-- group: 2 -->
+
+### Parallel Group Syntax (optional)
+
+Use `<!-- group: N -->` to control execution order in parallel mode:
+- Tasks with lower group numbers run first
+- Tasks with the same group run in parallel
+- Unannotated tasks run LAST (after all annotated groups)
+
+Example:
+```
+- [ ] Create user model <!-- group: 1 -->
+- [ ] Create post model <!-- group: 1 -->
+- [ ] Add relationships <!-- group: 2 -->
+- [ ] Update README  # runs last (no annotation)
+```
 
 ## Notes
 

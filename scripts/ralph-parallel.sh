@@ -478,36 +478,99 @@ run_parallel_tasks() {
   # Initialize run manifest (append-only for debugging)
   local manifest="$RUN_DIR/manifest.tsv"
   {
-    echo -e "timestamp\tphase\tjob_id\ttask_id\tbranch\tstatus\tlog_file\tworktree_dir"
+    echo -e "timestamp\tphase\trun_id\tgroup\tjob_id\ttask_id\tbranch\tstatus\tbase_sha\tlog_file\tworktree_dir"
   } > "$manifest"
   
-  # Get all pending tasks
-  local tasks=()
-  while IFS='|' read -r id status desc; do
-    if [[ "$status" == "pending" ]]; then
-      tasks+=("$id|$desc")
-    fi
-  done < <(get_all_tasks "$workspace")
+  # Get all pending groups (sorted numerically)
+  local groups=()
+  while read -r g; do
+    [[ -n "$g" ]] && groups+=("$g")
+  done < <(get_pending_groups "$workspace")
   
-  if [[ ${#tasks[@]} -eq 0 ]]; then
+  if [[ ${#groups[@]} -eq 0 ]]; then
     echo "✅ No pending tasks!"
     return 0
   fi
   
-  echo "📋 Found ${#tasks[@]} pending task(s)"
+  # Format group list for display (hide 999999, show as "unannotated")
+  local groups_display=""
+  for g in "${groups[@]}"; do
+    if [[ "$g" == "999999" ]]; then
+      groups_display+="unannotated "
+    else
+      groups_display+="$g "
+    fi
+  done
+  echo "📋 Found ${#groups[@]} group(s) to process: ${groups_display}"
   echo ""
   
-  # Track successful branches for merge phase (task completion only happens on successful merge)
-  local successful_items=() # branch|task_id|job_id|worktree_left_in_place
+  # Determine merge target BEFORE group loop (so all groups merge into same target)
+  local merge_target="$base_branch"
+  if [[ -n "$integration_branch" ]]; then
+    merge_target="$integration_branch"
+  fi
+  
+  # If CREATE_PR is set and no integration branch provided, create a default one.
+  if [[ "$CREATE_PR" == "true" ]] && [[ -z "$integration_branch" ]]; then
+    merge_target="ralph/parallel-${RUN_ID}"
+    integration_branch="$merge_target"
+  fi
+  
+  # Create/reset integration branch once (if different from base)
+  if [[ "$merge_target" != "$base_branch" ]]; then
+    git -C "$original_dir" checkout -B "$merge_target" "$BASE_SHA" 2>/dev/null || {
+      echo "❌ Failed to create/reset integration branch: $merge_target" >&2
+      return 1
+    }
+    echo "🔀 Integration branch: $merge_target (from $base_branch)"
+    echo ""
+  fi
+  
+  # Track totals across all groups
   local total_succeeded=0
   local total_failed=0
   local merged_count=0
+  local global_job_num=0
   
-  # Process tasks in batches
-  local batch_num=0
-  local task_idx=0
+  # Track ALL successful items for final PR (across all groups)
+  local all_successful_items=()
+  local all_merged_branches=()
+  local all_integrated_task_ids=()
   
-  while [[ $task_idx -lt ${#tasks[@]} ]]; do
+  # Process each group sequentially
+  for current_group in "${groups[@]}"; do
+    # Refresh task cache (RALPH_TASK.md may have changed from prior group merges)
+    rm -f "$workspace/.ralph/$TASK_MTIME_FILE"
+    parse_tasks "$workspace"
+    
+    # Get tasks for this group
+    local tasks=()
+    while IFS='|' read -r id status group desc; do
+      tasks+=("$id|$desc")
+    done < <(get_tasks_by_group "$workspace" "$current_group")
+    
+    if [[ ${#tasks[@]} -eq 0 ]]; then
+      continue
+    fi
+    
+    # Display group header
+    local group_label="$current_group"
+    [[ "$current_group" == "999999" ]] && group_label="unannotated (999999)"
+    
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "📦 Group $group_label: ${#tasks[@]} task(s)"
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+    
+    # Track successful branches for THIS GROUP's merge phase
+    local successful_items=()
+    
+    # Process tasks in batches within this group
+    local batch_num=0
+    local task_idx=0
+    
+    while [[ $task_idx -lt ${#tasks[@]} ]]; do
     batch_num=$((batch_num + 1))
     
     # Get batch of tasks
@@ -537,9 +600,9 @@ run_parallel_tasks() {
       local task_data="${tasks[$i]}"
       local task_id="${task_data%%|*}"
       local task_desc="${task_data#*|}"
-      local global_index=$((i + 1))
+      global_job_num=$((global_job_num + 1))
       local batch_slot=$((i - task_idx + 1))
-      local job_id="job${global_index}"
+      local job_id="job${global_job_num}"
       
       echo "  🔄 Agent ${batch_slot}/${batch_size} (job ${job_id}, task ${task_id}): ${task_desc:0:50}..."
       
@@ -572,8 +635,8 @@ run_parallel_tasks() {
       # Copy RALPH_TASK.md to worktree
       cp "$workspace/RALPH_TASK.md" "$worktree_dir/" 2>/dev/null || true
 
-      # Record in manifest
-      echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tstart\t${job_id}\t${task_id}\t${branch_name}\tstarting\t${log_file}\t${worktree_dir}" >> "$manifest"
+      # Record in manifest (with group, run_id, base_sha)
+      echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tstart\t${RUN_ID}\t${current_group}\t${job_id}\t${task_id}\t${branch_name}\tstarting\t${BASE_SHA}\t${log_file}\t${worktree_dir}" >> "$manifest"
       
       # Start agent in background
       (
@@ -673,7 +736,7 @@ run_parallel_tasks() {
       fi
 
       # Record completion in manifest
-      echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tfinish\t${job_id}\t${task_id}\t${branch_name}\t${status}/${output_status}\t${log_files[$j]}\t${worktree_dir}" >> "$manifest"
+      echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tfinish\t${RUN_ID}\t${current_group}\t${job_id}\t${task_id}\t${branch_name}\t${status}/${output_status}\t${BASE_SHA}\t${log_files[$j]}\t${worktree_dir}" >> "$manifest"
 
       # Track for merge phase (task completion happens on merge success)
       if [[ "$status" == "done" ]] && [[ "$output_status" == "success" ]]; then
@@ -684,7 +747,7 @@ run_parallel_tasks() {
       if [[ "$cleanup_result" != "left_in_place" ]]; then
         if [[ "$output_status" == "no_commits" ]] || [[ "$output_status" == "error" ]]; then
           delete_local_branch "$branch_name" "$original_dir"
-          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tbranch_cleanup\t${job_id}\t${task_id}\t${branch_name}\tdeleted\t${log_files[$j]}\t${worktree_dir}" >> "$manifest"
+          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tbranch_cleanup\t${RUN_ID}\t${current_group}\t${job_id}\t${task_id}\t${branch_name}\tdeleted\t${BASE_SHA}\t${log_files[$j]}\t${worktree_dir}" >> "$manifest"
         fi
       fi
       
@@ -696,41 +759,25 @@ run_parallel_tasks() {
     task_idx=$batch_end
   done
   
-  # Merge phase
-  local merge_target="$base_branch"
-  if [[ -n "$integration_branch" ]]; then
-    merge_target="$integration_branch"
-  fi
-
-  # If CREATE_PR is set and no integration branch provided, create a default one.
-  if [[ "$CREATE_PR" == "true" ]] && [[ -z "$integration_branch" ]]; then
-    merge_target="ralph/parallel-${RUN_ID}"
-    integration_branch="$merge_target"
-  fi
-
+  # =========================================================================
+  # MERGE PHASE FOR THIS GROUP
+  # =========================================================================
+  
   if [[ ${#successful_items[@]} -eq 0 ]]; then
     echo ""
-    echo "⚠️  No successful branches to merge."
+    echo "⚠️  Group $group_label: No successful branches to merge."
   elif [[ "$SKIP_MERGE" == "true" ]] && [[ "$CREATE_PR" != "true" ]]; then
     echo ""
-    echo "📝 Branches created (merge skipped):"
+    echo "📝 Group $group_label: Branches created (merge skipped):"
     for item in "${successful_items[@]}"; do
       local branch="${item%%|*}"
       echo "   - $branch"
     done
   else
     echo ""
-    echo "═══════════════════════════════════════════════════════════════════"
-    echo "📦 Merge Phase: merging ${#successful_items[@]} branch(es) into ${merge_target}"
-    echo "═══════════════════════════════════════════════════════════════════"
-
-    # Ensure merge target exists/reset (only when target differs from base branch)
-    if [[ "$merge_target" != "$base_branch" ]]; then
-      git -C "$original_dir" checkout -B "$merge_target" "$BASE_SHA" 2>/dev/null || {
-        echo "❌ Failed to create/reset integration branch: $merge_target" >&2
-        return 1
-      }
-    fi
+    echo "───────────────────────────────────────────────────────────────────"
+    echo "📦 Group $group_label: Merging ${#successful_items[@]} branch(es) into ${merge_target}"
+    echo "───────────────────────────────────────────────────────────────────"
 
     local merged_branches=()
     local failed_branches=()
@@ -750,7 +797,9 @@ run_parallel_tasks() {
           merged_count=$((merged_count + 1))
           merged_branches+=("$branch_name")
           integrated_task_ids+=("$task_id")
-          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tmerge\t${job_id}\t${task_id}\t${branch_name}\tmerged\t\t" >> "$manifest"
+          all_merged_branches+=("$branch_name")
+          all_integrated_task_ids+=("$task_id")
+          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tmerge\t${RUN_ID}\t${current_group}\t${job_id}\t${task_id}\t${branch_name}\tmerged\t${BASE_SHA}\t\t" >> "$manifest"
           # Delete merged branch if worktree was removed
           if [[ "$worktree_left" != "left_in_place" ]]; then
             delete_local_branch "$branch_name" "$original_dir"
@@ -760,12 +809,12 @@ run_parallel_tasks() {
           echo "⚠️  (conflict)"
           abort_merge "$original_dir"
           failed_branches+=("$branch_name")
-          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tmerge\t${job_id}\t${task_id}\t${branch_name}\tconflict\t\t" >> "$manifest"
+          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tmerge\t${RUN_ID}\t${current_group}\t${job_id}\t${task_id}\t${branch_name}\tconflict\t${BASE_SHA}\t\t" >> "$manifest"
           ;;
         *)
           echo "❌"
           failed_branches+=("$branch_name")
-          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tmerge\t${job_id}\t${task_id}\t${branch_name}\terror\t\t" >> "$manifest"
+          echo -e "$(date -u '+%Y-%m-%dT%H:%M:%SZ')\tmerge\t${RUN_ID}\t${current_group}\t${job_id}\t${task_id}\t${branch_name}\terror\t${BASE_SHA}\t\t" >> "$manifest"
           ;;
       esac
     done
@@ -786,6 +835,7 @@ run_parallel_tasks() {
 
         # Build a detailed commit message with merged branches for archaeology
         local commit_body="Run: ${RUN_ID}
+Group: ${current_group}
 
 Merged branches:"
         for b in "${merged_branches[@]}"; do
@@ -796,7 +846,7 @@ Merged branches:"
           commit_body+=$'\n'"  - $tid"
         done
 
-        local commit_msg="ralph: mark ${#integrated_task_ids[@]} task(s) complete
+        local commit_msg="ralph: mark ${#integrated_task_ids[@]} task(s) complete (group ${current_group})
 
 $commit_body"
 
@@ -812,8 +862,8 @@ $commit_body"
     fi
 
     echo ""
-    if [[ "$merged_count" -gt 0 ]]; then
-      echo "✅ Integrated $merged_count task(s) into $merge_target"
+    if [[ ${#merged_branches[@]} -gt 0 ]]; then
+      echo "✅ Group $group_label: Integrated ${#merged_branches[@]} task(s) into $merge_target"
     fi
     if [[ ${#failed_branches[@]} -gt 0 ]]; then
       echo "⚠️  Failed/conflicted branches preserved for manual review:"
@@ -821,34 +871,55 @@ $commit_body"
         echo "   - $b"
       done
     fi
+  fi
+  
+  # Check if group still has pending tasks (failed merges left them incomplete)
+  rm -f "$workspace/.ralph/$TASK_MTIME_FILE"
+  parse_tasks "$workspace"
+  local remaining
+  remaining=$(get_tasks_by_group "$workspace" "$current_group" | wc -l | tr -d ' ')
+  if [[ "$remaining" -gt 0 ]]; then
+    echo ""
+    echo "⚠️  Group $group_label still has $remaining pending task(s) after merge phase"
+    echo "   (failed merges leave tasks incomplete - fix conflicts and re-run)"
+  fi
+  
+  done  # end of group loop
+  
+  # =========================================================================
+  # PR CREATION (once, after all groups complete)
+  # =========================================================================
+  
+  if [[ "$CREATE_PR" == "true" ]]; then
+    if [[ "$merge_target" == "$base_branch" ]]; then
+      echo ""
+      echo "⚠️  Cannot open PR: integration branch equals base branch ($base_branch)"
+    elif [[ ${#all_merged_branches[@]} -eq 0 ]]; then
+      echo ""
+      echo "⚠️  No branches were merged; skipping PR creation."
+    else
+      echo ""
+      echo "═══════════════════════════════════════════════════════════════════"
+      echo "📝 Creating PR: $merge_target -> $base_branch"
+      echo "═══════════════════════════════════════════════════════════════════"
 
-    # Create a single PR for integration branch if requested
-    if [[ "$CREATE_PR" == "true" ]]; then
-      if [[ "$merge_target" == "$base_branch" ]]; then
-        echo "⚠️  Cannot open PR: integration branch equals base branch ($base_branch)"
+      if git -C "$original_dir" remote get-url origin &>/dev/null; then
+        git -C "$original_dir" push -u origin "$merge_target" 2>/dev/null || git -C "$original_dir" push origin "$merge_target" || true
       else
-        echo ""
-        echo "📝 Creating PR: $merge_target -> $base_branch"
+        echo "⚠️  No remote 'origin' configured; skipping push/PR creation."
+        echo "   To create a PR later, push and run:"
+        echo "   git push -u origin \"$merge_target\""
+        echo "   gh pr create --base \"$base_branch\" --head \"$merge_target\" --fill"
+      fi
 
-        if git -C "$original_dir" remote get-url origin &>/dev/null; then
-          git -C "$original_dir" push -u origin "$merge_target" 2>/dev/null || git -C "$original_dir" push origin "$merge_target" || true
-        else
-          echo "⚠️  No remote 'origin' configured; skipping push/PR creation."
-          echo "   To create a PR later, push and run:"
-          echo "   git push -u origin \"$merge_target\""
+      if command -v gh &>/dev/null; then
+        (cd "$original_dir" && gh pr create --base "$base_branch" --head "$merge_target" --fill) || {
+          echo "⚠️  gh pr create failed. You can create it manually with:"
           echo "   gh pr create --base \"$base_branch\" --head \"$merge_target\" --fill"
-          return 0
-        fi
-
-        if command -v gh &>/dev/null; then
-          (cd "$original_dir" && gh pr create --base "$base_branch" --head "$merge_target" --fill) || {
-            echo "⚠️  gh pr create failed. You can create it manually with:"
-            echo "   gh pr create --base \"$base_branch\" --head \"$merge_target\" --fill"
-          }
-        else
-          echo "⚠️  gh CLI not found. Create PR manually with:"
-          echo "   gh pr create --base \"$base_branch\" --head \"$merge_target\" --fill"
-        fi
+        }
+      else
+        echo "⚠️  gh CLI not found. Create PR manually with:"
+        echo "   gh pr create --base \"$base_branch\" --head \"$merge_target\" --fill"
       fi
     fi
   fi

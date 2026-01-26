@@ -22,6 +22,10 @@
 TASK_CACHE_FILE="tasks.yaml"
 TASK_MTIME_FILE="tasks.mtime"
 
+# Default group for unannotated tasks (999999 = runs last in parallel mode)
+# Override with DEFAULT_GROUP=0 to make unannotated tasks run first
+DEFAULT_GROUP="${DEFAULT_GROUP:-999999}"
+
 # =============================================================================
 # INTERNAL: CACHE MANAGEMENT
 # =============================================================================
@@ -121,6 +125,16 @@ _write_cache() {
         local status_char="${BASH_REMATCH[2]}"
         local description="${BASH_REMATCH[3]}"
         
+        # Extract parallel_group from line (first match wins)
+        # Format: <!-- group: N --> where N is a number
+        local parallel_group="$DEFAULT_GROUP"
+        if [[ "$line" =~ \<!--[[:space:]]*group:[[:space:]]*([0-9]+)[[:space:]]*--\> ]]; then
+          parallel_group="${BASH_REMATCH[1]}"
+        fi
+        
+        # Strip ALL group comments from description for cleanliness
+        description="$(sed -E 's/[[:space:]]*<!--[[:space:]]*group:[[:space:]]*[0-9]+[[:space:]]*-->[[:space:]]*//g' <<<"$description")"
+        
         # Determine status
         local status="pending"
         if [[ "$status_char" == "x" ]] || [[ "$status_char" == "X" ]]; then
@@ -135,6 +149,7 @@ _write_cache() {
         echo "  - id: \"line_$line_num\""
         echo "    line_number: $line_num"
         echo "    status: $status"
+        echo "    parallel_group: $parallel_group"
         echo "    description: $(_yaml_escape "$description")"
         echo "    indent_level: $indent_level"
         echo "    raw_marker: $(_yaml_escape "$marker")"
@@ -251,6 +266,108 @@ _parse_tasks_direct() {
       echo "line_$line_num|$status|$description"
     fi
   done < "$task_file"
+}
+
+# Get all tasks WITH group info (extended format for parallel mode)
+# Format: id|status|group|description
+# Note: get_all_tasks() is kept stable for backward compatibility
+get_all_tasks_with_group() {
+  local workspace="${1:-.}"
+  local ralph_dir="$workspace/.ralph"
+  local cache_file="$ralph_dir/$TASK_CACHE_FILE"
+  
+  # Ensure cache is valid
+  parse_tasks "$workspace" || return 1
+  
+  if [[ -f "$cache_file" ]]; then
+    local current_id="" current_status="" current_group="" current_desc=""
+    while IFS= read -r line; do
+      line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
+      
+      if [[ "$line" =~ ^-\ id:\ \"?([^\"]+)\"?$ ]]; then
+        # New task entry - output previous if exists
+        if [[ -n "$current_id" ]]; then
+          echo "$current_id|$current_status|$current_group|$current_desc"
+        fi
+        current_id="${BASH_REMATCH[1]}"
+        current_status=""
+        current_group="$DEFAULT_GROUP"
+        current_desc=""
+      elif [[ "$line" =~ ^status:\ (.+)$ ]]; then
+        current_status="${BASH_REMATCH[1]}"
+      elif [[ "$line" =~ ^parallel_group:\ (.+)$ ]]; then
+        current_group="${BASH_REMATCH[1]}"
+      elif [[ "$line" =~ ^description:\ \"?(.*)\"?$ ]]; then
+        current_desc="${BASH_REMATCH[1]}"
+        current_desc="${current_desc%\"}"
+      fi
+    done < "$cache_file"
+    
+    # Output last task
+    if [[ -n "$current_id" ]]; then
+      echo "$current_id|$current_status|$current_group|$current_desc"
+    fi
+  else
+    # Fallback: parse directly (returns default group for all)
+    _parse_tasks_direct_with_group "$workspace/RALPH_TASK.md"
+  fi
+}
+
+# Parse tasks with group directly from markdown (fallback)
+_parse_tasks_direct_with_group() {
+  local task_file="$1"
+  local line_num=0
+  
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_num=$((line_num + 1))
+    line=$(_normalize_line_endings <<< "$line")
+    
+    if [[ "$line" =~ ^[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+\[(x|X|\ )\][[:space:]]+(.*) ]]; then
+      local status_char="${BASH_REMATCH[2]}"
+      local description="${BASH_REMATCH[3]}"
+      
+      # Extract group
+      local group="$DEFAULT_GROUP"
+      if [[ "$line" =~ \<!--[[:space:]]*group:[[:space:]]*([0-9]+)[[:space:]]*--\> ]]; then
+        group="${BASH_REMATCH[1]}"
+      fi
+      
+      # Strip group comment from description
+      description="$(sed -E 's/[[:space:]]*<!--[[:space:]]*group:[[:space:]]*[0-9]+[[:space:]]*-->[[:space:]]*//g' <<<"$description")"
+      
+      local status="pending"
+      if [[ "$status_char" == "x" ]] || [[ "$status_char" == "X" ]]; then
+        status="completed"
+      fi
+      
+      echo "line_$line_num|$status|$group|$description"
+    fi
+  done < "$task_file"
+}
+
+# Get all pending tasks for a specific group
+# Format: id|task_status|group|description
+get_tasks_by_group() {
+  local workspace="${1:-.}"
+  local target_group="$2"
+  
+  get_all_tasks_with_group "$workspace" | while IFS='|' read -r task_id task_status task_group task_desc; do
+    if [[ "$task_status" == "pending" ]] && [[ "$task_group" == "$target_group" ]]; then
+      echo "$task_id|$task_status|$task_group|$task_desc"
+    fi
+  done
+}
+
+# Get sorted list of unique groups that have pending tasks
+# Returns one group number per line, sorted numerically
+get_pending_groups() {
+  local workspace="${1:-.}"
+  
+  get_all_tasks_with_group "$workspace" | while IFS='|' read -r task_id task_status task_group task_desc; do
+    if [[ "$task_status" == "pending" ]]; then
+      echo "$task_group"
+    fi
+  done | sort -n | uniq
 }
 
 # Get the next incomplete task

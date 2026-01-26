@@ -67,13 +67,13 @@ The task is complete when ALL of the following are true:
 
 1. [ ] `pnpm start` runs the server without errors
 2. [ ] POST /tasks implemented (validation + tests)
-3. [ ] GET /tasks implemented (pagination/filtering + tests)
-4. [ ] GET /tasks/:id implemented (404 + tests)
-5. [ ] PUT /tasks/:id implemented (validation + 404 + tests)
-6. [ ] PATCH /tasks/:id/complete implemented (tests)
-7. [ ] DELETE /tasks/:id implemented (404 + tests)
-8. [ ] Test coverage > 80% (run `pnpm test -- --coverage`)
-9. [ ] README.md documents all endpoints with examples
+3. [ ] GET /tasks implemented (pagination/filtering + tests) <!-- group: 1 -->
+4. [ ] GET /tasks/:id implemented (404 + tests) <!-- group: 1 -->
+5. [ ] PUT /tasks/:id implemented (validation + 404 + tests) <!-- group: 1 -->
+6. [ ] PATCH /tasks/:id/complete implemented (tests) <!-- group: 1 -->
+7. [ ] DELETE /tasks/:id implemented (404 + tests) <!-- group: 1 -->
+8. [ ] Test coverage > 80% (run `pnpm test -- --coverage`) <!-- group: 2 -->
+9. [ ] README.md documents all endpoints with examples  # runs last (unannotated)
 
 ## Technical Notes
 

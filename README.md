@@ -374,6 +374,37 @@ For best results, structure your work in two phases:
 This pattern maximizes parallelism while avoiding merge conflicts on shared files.
 The integration pass runs after parallel agents finish and handles all "touch everything" work.
 
+### Task Groups (Phased Execution)
+
+Control execution order with `<!-- group: N -->` annotations:
+
+```markdown
+# Tasks
+
+- [ ] Create database schema <!-- group: 1 -->
+- [ ] Create User model <!-- group: 1 -->
+- [ ] Create Post model <!-- group: 1 -->
+- [ ] Add relationships between models <!-- group: 2 -->
+- [ ] Build API endpoints <!-- group: 3 -->
+- [ ] Update README  # no annotation = runs LAST
+```
+
+**Execution order:**
+1. Group 1 - runs first (all tasks in parallel, up to `--max-parallel`)
+2. Group 2 - runs after group 1 merges complete
+3. Group 3 - runs after group 2 merges complete
+4. Unannotated tasks - run LAST (after all annotated groups)
+
+**Why unannotated = last?**
+- Safer default: forgetting to annotate doesn't jump the queue
+- Integration/polish tasks naturally go last
+- Override with `DEFAULT_GROUP=0` env var if you prefer unannotated first
+
+**Within each group:**
+- Tasks run in parallel (up to `--max-parallel`)
+- All merges complete before next group starts
+- RALPH_TASK.md checkboxes updated per group
+
 **Worktree structure:**
 ```
 project/
