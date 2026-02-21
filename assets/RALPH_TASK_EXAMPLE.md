@@ -127,9 +127,10 @@ When working on this task:
 
 1. Read `.ralph/progress.md` to see what's been done
 2. Check `.ralph/guardrails.md` for signs to follow
-3. Work on the next incomplete criterion from the checklist above
-4. Update `.ralph/progress.md` with your progress
-5. Commit your changes with descriptive messages
-6. Run tests frequently to verify progress
-7. When ALL criteria are met (all `[ ]` → `[x]`), output: `<ralph>COMPLETE</ralph>`
-8. If stuck on the same issue 3+ times, output: `<ralph>GUTTER</ralph>`
+3. If present, read `.ralph/review.md` and address review findings
+4. Work on the next incomplete criterion from the checklist above
+5. Update `.ralph/progress.md` with your progress
+6. Commit your changes with descriptive messages
+7. Run tests frequently to verify progress
+8. When ALL criteria are met (all `[ ]` → `[x]`), output: `<ralph>COMPLETE</ralph>`
+9. If stuck on the same issue 3+ times, output: `<ralph>GUTTER</ralph>`

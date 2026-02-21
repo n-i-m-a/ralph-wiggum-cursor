@@ -7,7 +7,8 @@
 # Usage:
 #   ./ralph-once.sh                    # Run single iteration
 #   ./ralph-once.sh /path/to/project   # Run in specific project
-#   ./ralph-once.sh -m gpt-5.2-high    # Use specific model
+#   ./ralph-once.sh -m gpt-5.3-codex-high    # Use specific model
+#   ./ralph-once.sh --review-model sonnet-4.6-thinking
 #
 # After running:
 #   - Review the changes made
@@ -41,12 +42,14 @@ Usage:
   ./ralph-once.sh [options] [workspace]
 
 Options:
-  -m, --model MODEL      Model to use (default: opus-4.5-thinking)
+  -m, --model MODEL      Model to use (default: opus-4.6-thinking)
+  --review-model MODEL   Optional review model (disabled by default)
   -h, --help             Show this help
 
 Examples:
   ./ralph-once.sh                        # Run one iteration
-  ./ralph-once.sh -m sonnet-4.5-thinking # Use Sonnet model
+  ./ralph-once.sh -m sonnet-4.6-thinking # Use Sonnet model
+  ./ralph-once.sh --review-model sonnet-4.6-thinking
   
 After reviewing the results:
   - If satisfied: run ./ralph-setup.sh for full loop
@@ -61,6 +64,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -m|--model)
       MODEL="$2"
+      shift 2
+      ;;
+    --review-model)
+      REVIEW_MODEL="$2"
       shift 2
       ;;
     -h|--help)
@@ -117,6 +124,7 @@ main() {
   
   echo "Workspace: $WORKSPACE"
   echo "Model:     $MODEL"
+  [[ -n "${REVIEW_MODEL:-}" ]] && echo "Review:    $REVIEW_MODEL"
   echo ""
   
   # Show task summary
@@ -169,6 +177,10 @@ main() {
   # Check result
   local task_status
   task_status=$(check_task_complete "$WORKSPACE")
+  local review_result=""
+  if [[ "$task_status" == "COMPLETE" ]] && [[ -n "${REVIEW_MODEL:-}" ]]; then
+    review_result=$(run_review "$WORKSPACE" "1" "$MODEL" "$SCRIPT_DIR")
+  fi
   
   echo ""
   echo "═══════════════════════════════════════════════════════════════════"
@@ -179,9 +191,14 @@ main() {
   case "$signal" in
     "COMPLETE")
       if [[ "$task_status" == "COMPLETE" ]]; then
-        echo "🎉 Task completed in single iteration!"
-        echo ""
-        echo "All criteria are checked. You're done!"
+        if [[ -n "${REVIEW_MODEL:-}" ]] && [[ "$review_result" != "PASS" ]]; then
+          echo "⚠️  Task criteria are complete, but review failed."
+          echo "   Check .ralph/review.md and run another iteration."
+        else
+          echo "🎉 Task completed in single iteration!"
+          echo ""
+          echo "All criteria are checked. You're done!"
+        fi
       else
         echo "⚠️  Agent signaled complete but some criteria remain unchecked."
         echo "   Review the results and run again if needed."
@@ -203,7 +220,12 @@ main() {
       ;;
     *)
       if [[ "$task_status" == "COMPLETE" ]]; then
-        echo "🎉 Task completed in single iteration!"
+        if [[ -n "${REVIEW_MODEL:-}" ]] && [[ "$review_result" != "PASS" ]]; then
+          echo "⚠️  Task criteria are complete, but review failed."
+          echo "   Check .ralph/review.md and run another iteration."
+        else
+          echo "🎉 Task completed in single iteration!"
+        fi
       else
         local remaining_count=${task_status#INCOMPLETE:}
         echo "Agent finished with $remaining_count criteria remaining."

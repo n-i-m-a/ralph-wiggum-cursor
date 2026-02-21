@@ -45,7 +45,22 @@ _get_file_mtime() {
   fi
 }
 
-# Check if cache is valid (mtime matches)
+# Build a cache signature (mtime:size:checksum) to avoid stale cache when
+# files are edited multiple times within the same second.
+_get_file_signature() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "0:0:0"
+    return
+  fi
+  local mtime size checksum
+  mtime=$(_get_file_mtime "$file")
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ' || echo "0")
+  checksum=$(cksum "$file" 2>/dev/null | awk '{print $1}' || echo "0")
+  echo "${mtime}:${size}:${checksum}"
+}
+
+# Check if cache is valid (file signature matches)
 _is_cache_valid() {
   local workspace="${1:-.}"
   local task_file="$workspace/RALPH_TASK.md"
@@ -57,12 +72,13 @@ _is_cache_valid() {
   [[ ! -f "$cache_file" ]] && return 1
   [[ ! -f "$mtime_file" ]] && return 1
   
-  # Compare mtimes
-  local current_mtime=$(_get_file_mtime "$task_file")
-  local cached_mtime
-  cached_mtime=$(cat "$mtime_file" 2>/dev/null) || cached_mtime="0"
-  
-  [[ "$current_mtime" == "$cached_mtime" ]]
+  # Compare signatures
+  local current_sig
+  current_sig=$(_get_file_signature "$task_file")
+  local cached_sig
+  cached_sig=$(cat "$mtime_file" 2>/dev/null) || cached_sig="0:0:0"
+
+  [[ "$current_sig" == "$cached_sig" ]]
 }
 
 # Normalize line endings (CRLF -> LF)
@@ -88,6 +104,27 @@ _yaml_escape() {
   fi
 }
 
+# Decode a scalar emitted by _yaml_escape (quoted or plain)
+_yaml_unescape() {
+  local str="$1"
+  # Remove surrounding quotes when present.
+  if [[ "$str" =~ ^\"(.*)\"$ ]]; then
+    str="${BASH_REMATCH[1]}"
+  fi
+  # Reverse escaping order from _yaml_escape.
+  str="${str//\\\"/\"}"
+  str="${str//\\\\/\\}"
+  echo "$str"
+}
+
+# Trim leading/trailing whitespace
+_trim() {
+  local str="$1"
+  str="${str#"${str%%[![:space:]]*}"}"
+  str="${str%"${str##*[![:space:]]}"}"
+  echo "$str"
+}
+
 # Write task cache to YAML format
 _write_cache() {
   local workspace="${1:-.}"
@@ -98,8 +135,11 @@ _write_cache() {
   
   mkdir -p "$ralph_dir"
   
-  # Get current mtime
-  local current_mtime=$(_get_file_mtime "$task_file")
+  # Get current file signature
+  local current_sig
+  current_sig=$(_get_file_signature "$task_file")
+  local current_mtime
+  current_mtime=$(_get_file_mtime "$task_file")
   
   # Parse tasks and write YAML
   {
@@ -109,6 +149,7 @@ _write_cache() {
     echo ""
     echo "source_file: RALPH_TASK.md"
     echo "source_mtime: $current_mtime"
+    echo "source_signature: $current_sig"
     echo "generated_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo ""
     echo "tasks:"
@@ -131,9 +172,17 @@ _write_cache() {
         if [[ "$line" =~ \<!--[[:space:]]*group:[[:space:]]*([0-9]+)[[:space:]]*--\> ]]; then
           parallel_group="${BASH_REMATCH[1]}"
         fi
+        # Optional step-level model annotation:
+        # Format: <!-- model: model-id -->
+        local task_model=""
+        if [[ "$line" =~ \<!--[[:space:]]*model:[[:space:]]*([^>]+)[[:space:]]*--\> ]]; then
+          task_model="$(_trim "${BASH_REMATCH[1]}")"
+        fi
         
         # Strip ALL group comments from description for cleanliness
         description="$(sed -E 's/[[:space:]]*<!--[[:space:]]*group:[[:space:]]*[0-9]+[[:space:]]*-->[[:space:]]*//g' <<<"$description")"
+        # Strip ALL model comments from description for cleanliness
+        description="$(sed -E 's/[[:space:]]*<!--[[:space:]]*model:[[:space:]]*[^>]+[[:space:]]*-->[[:space:]]*//g' <<<"$description")"
         
         # Determine status
         local status="pending"
@@ -150,6 +199,7 @@ _write_cache() {
         echo "    line_number: $line_num"
         echo "    status: $status"
         echo "    parallel_group: $parallel_group"
+        echo "    model: $(_yaml_escape "$task_model")"
         echo "    description: $(_yaml_escape "$description")"
         echo "    indent_level: $indent_level"
         echo "    raw_marker: $(_yaml_escape "$marker")"
@@ -158,8 +208,8 @@ _write_cache() {
     
   } > "$cache_file"
   
-  # Save mtime
-  echo "$current_mtime" > "$mtime_file"
+  # Save signature
+  echo "$current_sig" > "$mtime_file"
 }
 
 # Read a value from YAML cache (simple key extraction)
@@ -228,10 +278,8 @@ get_all_tasks() {
         current_desc=""
       elif [[ "$line" =~ ^status:\ (.+)$ ]]; then
         current_status="${BASH_REMATCH[1]}"
-      elif [[ "$line" =~ ^description:\ \"?(.*)\"?$ ]]; then
-        current_desc="${BASH_REMATCH[1]}"
-        # Remove trailing quote if present
-        current_desc="${current_desc%\"}"
+      elif [[ "$line" =~ ^description:\ (.+)$ ]]; then
+        current_desc="$(_yaml_unescape "${BASH_REMATCH[1]}")"
       fi
     done < "$cache_file"
     
@@ -268,8 +316,8 @@ _parse_tasks_direct() {
   done < "$task_file"
 }
 
-# Get all tasks WITH group info (extended format for parallel mode)
-# Format: id|status|group|description
+# Get all tasks WITH group/model info (extended format for parallel mode)
+# Format: id|status|group|model|description
 # Note: get_all_tasks() is kept stable for backward compatibility
 get_all_tasks_with_group() {
   local workspace="${1:-.}"
@@ -280,40 +328,42 @@ get_all_tasks_with_group() {
   parse_tasks "$workspace" || return 1
   
   if [[ -f "$cache_file" ]]; then
-    local current_id="" current_status="" current_group="" current_desc=""
+    local current_id="" current_status="" current_group="" current_model="" current_desc=""
     while IFS= read -r line; do
       line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
       
       if [[ "$line" =~ ^-\ id:\ \"?([^\"]+)\"?$ ]]; then
         # New task entry - output previous if exists
         if [[ -n "$current_id" ]]; then
-          echo "$current_id|$current_status|$current_group|$current_desc"
+          echo "$current_id|$current_status|$current_group|$current_model|$current_desc"
         fi
         current_id="${BASH_REMATCH[1]}"
         current_status=""
         current_group="$DEFAULT_GROUP"
+        current_model=""
         current_desc=""
       elif [[ "$line" =~ ^status:\ (.+)$ ]]; then
         current_status="${BASH_REMATCH[1]}"
       elif [[ "$line" =~ ^parallel_group:\ (.+)$ ]]; then
         current_group="${BASH_REMATCH[1]}"
-      elif [[ "$line" =~ ^description:\ \"?(.*)\"?$ ]]; then
-        current_desc="${BASH_REMATCH[1]}"
-        current_desc="${current_desc%\"}"
+      elif [[ "$line" =~ ^model:\ (.+)$ ]]; then
+        current_model="$(_yaml_unescape "${BASH_REMATCH[1]}")"
+      elif [[ "$line" =~ ^description:\ (.+)$ ]]; then
+        current_desc="$(_yaml_unescape "${BASH_REMATCH[1]}")"
       fi
     done < "$cache_file"
     
     # Output last task
     if [[ -n "$current_id" ]]; then
-      echo "$current_id|$current_status|$current_group|$current_desc"
+      echo "$current_id|$current_status|$current_group|$current_model|$current_desc"
     fi
   else
-    # Fallback: parse directly (returns default group for all)
+    # Fallback: parse directly
     _parse_tasks_direct_with_group "$workspace/RALPH_TASK.md"
   fi
 }
 
-# Parse tasks with group directly from markdown (fallback)
+# Parse tasks with group/model directly from markdown (fallback)
 _parse_tasks_direct_with_group() {
   local task_file="$1"
   local line_num=0
@@ -331,29 +381,36 @@ _parse_tasks_direct_with_group() {
       if [[ "$line" =~ \<!--[[:space:]]*group:[[:space:]]*([0-9]+)[[:space:]]*--\> ]]; then
         group="${BASH_REMATCH[1]}"
       fi
+      # Extract model
+      local task_model=""
+      if [[ "$line" =~ \<!--[[:space:]]*model:[[:space:]]*([^>]+)[[:space:]]*--\> ]]; then
+        task_model="$(_trim "${BASH_REMATCH[1]}")"
+      fi
       
       # Strip group comment from description
       description="$(sed -E 's/[[:space:]]*<!--[[:space:]]*group:[[:space:]]*[0-9]+[[:space:]]*-->[[:space:]]*//g' <<<"$description")"
+      # Strip model comment from description
+      description="$(sed -E 's/[[:space:]]*<!--[[:space:]]*model:[[:space:]]*[^>]+[[:space:]]*-->[[:space:]]*//g' <<<"$description")"
       
       local status="pending"
       if [[ "$status_char" == "x" ]] || [[ "$status_char" == "X" ]]; then
         status="completed"
       fi
       
-      echo "line_$line_num|$status|$group|$description"
+      echo "line_$line_num|$status|$group|$task_model|$description"
     fi
   done < "$task_file"
 }
 
 # Get all pending tasks for a specific group
-# Format: id|task_status|group|description
+# Format: id|task_status|group|model|description
 get_tasks_by_group() {
   local workspace="${1:-.}"
   local target_group="$2"
   
-  get_all_tasks_with_group "$workspace" | while IFS='|' read -r task_id task_status task_group task_desc; do
+  get_all_tasks_with_group "$workspace" | while IFS='|' read -r task_id task_status task_group task_model task_desc; do
     if [[ "$task_status" == "pending" ]] && [[ "$task_group" == "$target_group" ]]; then
-      echo "$task_id|$task_status|$task_group|$task_desc"
+      echo "$task_id|$task_status|$task_group|$task_model|$task_desc"
     fi
   done
 }
@@ -363,7 +420,7 @@ get_tasks_by_group() {
 get_pending_groups() {
   local workspace="${1:-.}"
   
-  get_all_tasks_with_group "$workspace" | while IFS='|' read -r task_id task_status task_group task_desc; do
+  get_all_tasks_with_group "$workspace" | while IFS='|' read -r task_id task_status task_group task_model task_desc; do
     if [[ "$task_status" == "pending" ]]; then
       echo "$task_group"
     fi
@@ -392,6 +449,20 @@ get_task_by_id() {
   get_all_tasks "$workspace" | while IFS='|' read -r id status desc; do
     if [[ "$id" == "$target_id" ]]; then
       echo "$id|$status|$desc"
+      break
+    fi
+  done
+}
+
+# Get task model by task ID
+# Returns: model string, or empty if task has no model/doesn't exist
+get_task_model() {
+  local workspace="${1:-.}"
+  local target_id="$2"
+
+  get_all_tasks_with_group "$workspace" | while IFS='|' read -r id status group model desc; do
+    if [[ "$id" == "$target_id" ]]; then
+      echo "$model"
       break
     fi
   done
@@ -456,10 +527,17 @@ mark_task_complete() {
   fi
   
   # Use sed to replace [ ] with [x] on the specific line
+  local before_line after_line
+  before_line=$(sed -n "${line_num}p" "$task_file" 2>/dev/null || echo "")
   if [[ "$OSTYPE" == "darwin"* ]]; then
     sed -i '' "${line_num}s/\[ \]/[x]/" "$task_file"
   else
     sed -i "${line_num}s/\[ \]/[x]/" "$task_file"
+  fi
+  after_line=$(sed -n "${line_num}p" "$task_file" 2>/dev/null || echo "")
+  if [[ "$before_line" == "$after_line" ]]; then
+    echo "ERROR: Failed to mark task complete for $task_id (line $line_num unchanged)" >&2
+    return 1
   fi
   
   # Invalidate cache by removing mtime file
@@ -487,10 +565,17 @@ mark_task_incomplete() {
   fi
   
   # Use sed to replace [x] or [X] with [ ] on the specific line
+  local before_line after_line
+  before_line=$(sed -n "${line_num}p" "$task_file" 2>/dev/null || echo "")
   if [[ "$OSTYPE" == "darwin"* ]]; then
     sed -i '' "${line_num}s/\[[xX]\]/[ ]/" "$task_file"
   else
     sed -i "${line_num}s/\[[xX]\]/[ ]/" "$task_file"
+  fi
+  after_line=$(sed -n "${line_num}p" "$task_file" 2>/dev/null || echo "")
+  if [[ "$before_line" == "$after_line" ]]; then
+    echo "ERROR: Failed to mark task incomplete for $task_id (line $line_num unchanged)" >&2
+    return 1
   fi
   
   # Invalidate cache
@@ -549,26 +634,31 @@ import_tasks_yaml() {
 # Get progress as "done:total" format (compatible with existing count_criteria)
 get_progress() {
   local workspace="${1:-.}"
-  local done=$(count_completed "$workspace")
-  local total=$(count_total "$workspace")
-  echo "$done:$total"
+  local done_count
+  done_count=$(count_completed "$workspace")
+  local total
+  total=$(count_total "$workspace")
+  echo "$done_count:$total"
 }
 
 # Check if all tasks are complete
 is_all_complete() {
   local workspace="${1:-.}"
-  local remaining=$(count_remaining "$workspace")
+  local remaining
+  remaining=$(count_remaining "$workspace")
   [[ "$remaining" -eq 0 ]]
 }
 
 # Pretty print task status
 print_task_status() {
   local workspace="${1:-.}"
-  local done=$(count_completed "$workspace")
-  local total=$(count_total "$workspace")
-  local remaining=$((total - done))
+  local done_count
+  done_count=$(count_completed "$workspace")
+  local total
+  total=$(count_total "$workspace")
+  local remaining=$((total - done_count))
   
-  echo "Task Progress: $done / $total complete ($remaining remaining)"
+  echo "Task Progress: $done_count / $total complete ($remaining remaining)"
   echo ""
   echo "Tasks:"
   

@@ -42,10 +42,10 @@ fi
 
 # Model options
 MODELS=(
-  "opus-4.5-thinking"
-  "sonnet-4.5-thinking"
-  "gpt-5.2-high"
-  "composer-1"
+  "opus-4.6-thinking"
+  "sonnet-4.6-thinking"
+  "gpt-5.3-codex-high"
+  "composer-1.5"
   "Custom..."
 )
 
@@ -107,6 +107,7 @@ select_options() {
     "Run single iteration first"
     "Work on new branch"
     "Open PR when complete"
+    "Enable review model"
     "Run in parallel mode"
   )
   
@@ -275,6 +276,7 @@ main() {
   local max_parallel=3
   USE_BRANCH=""
   OPEN_PR=false
+  REVIEW_MODEL="${REVIEW_MODEL:-}"
   
   while IFS= read -r opt; do
     case "$opt" in
@@ -292,6 +294,10 @@ main() {
       "Open PR when complete")
         OPEN_PR=true
         echo "✓ Will open PR when complete"
+        ;;
+      "Enable review model")
+        REVIEW_MODEL=$(select_model)
+        echo "✓ Review model: $REVIEW_MODEL"
         ;;
       "Run in parallel mode")
         parallel_mode=true
@@ -319,6 +325,7 @@ main() {
   echo "─────────────────────────────────────────────────────────────────"
   echo "Summary:"
   echo "  • Model:      $MODEL"
+  [[ -n "${REVIEW_MODEL:-}" ]] && echo "  • Review:     $REVIEW_MODEL"
   echo "  • Iterations: $MAX_ITERATIONS max"
   [[ -n "$USE_BRANCH" ]] && echo "  • Branch:     $USE_BRANCH"
   [[ "$OPEN_PR" == "true" ]] && echo "  • Open PR:    Yes"
@@ -338,6 +345,7 @@ main() {
   
   # Export settings for the loop
   export MODEL
+  export REVIEW_MODEL
   export MAX_ITERATIONS
   export USE_BRANCH
   export OPEN_PR

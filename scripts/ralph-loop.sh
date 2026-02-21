@@ -9,13 +9,14 @@
 # Usage:
 #   ./ralph-loop.sh                              # Start from current directory
 #   ./ralph-loop.sh /path/to/project             # Start from specific project
-#   ./ralph-loop.sh -n 50 -m gpt-5.2-high        # Custom iterations and model
+#   ./ralph-loop.sh -n 50 -m gpt-5.3-codex-high        # Custom iterations and model
 #   ./ralph-loop.sh --branch feature/foo --pr   # Create branch and PR
 #   ./ralph-loop.sh -y                           # Skip confirmation (for scripting)
 #
 # Flags:
 #   -n, --iterations N     Max iterations (default: 20)
-#   -m, --model MODEL      Model to use (default: opus-4.5-thinking)
+#   -m, --model MODEL      Model to use (default: opus-4.6-thinking)
+#   --review-model MODEL   Optional review model (disabled by default)
 #   --branch NAME          Sequential: create/work on branch; Parallel: integration branch name
 #   --pr                   Sequential: open PR (requires --branch); Parallel: open ONE integration PR (branch optional)
 #   --parallel             Run tasks in parallel with worktrees
@@ -55,7 +56,8 @@ Usage:
 
 Options:
   -n, --iterations N     Max iterations (default: 20)
-  -m, --model MODEL      Model to use (default: opus-4.5-thinking)
+  -m, --model MODEL      Model to use (default: opus-4.6-thinking)
+  --review-model MODEL   Optional review model (disabled by default)
   --branch NAME          Sequential: create/work on branch; Parallel: integration branch name
   --pr                   Sequential: open PR (requires --branch); Parallel: open ONE integration PR (branch optional)
   --parallel             Run tasks in parallel with worktrees
@@ -67,12 +69,13 @@ Options:
 Examples:
   ./ralph-loop.sh                                    # Interactive mode
   ./ralph-loop.sh -n 50                              # 50 iterations max
-  ./ralph-loop.sh -m gpt-5.2-high                    # Use GPT model
+  ./ralph-loop.sh -m gpt-5.3-codex-high                    # Use GPT model
   ./ralph-loop.sh --branch feature/api --pr -y      # Scripted PR workflow
   ./ralph-loop.sh --parallel --max-parallel 4        # Run 4 agents in parallel
   
 Environment:
   RALPH_MODEL            Override default model (same as -m flag)
+  RALPH_REVIEW_MODEL     Optional review model (same as --review-model)
 
 For interactive setup with a beautiful UI, use ralph-setup.sh instead.
 EOF
@@ -94,6 +97,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -m|--model)
       MODEL="$2"
+      shift 2
+      ;;
+    --review-model)
+      REVIEW_MODEL="$2"
       shift 2
       ;;
     --branch)
@@ -192,6 +199,7 @@ main() {
   
   echo "Progress: $done_criteria / $total_criteria criteria complete ($remaining remaining)"
   echo "Model:    $MODEL"
+  [[ -n "${REVIEW_MODEL:-}" ]] && echo "Review:   $REVIEW_MODEL"
   echo "Max iter: $MAX_ITERATIONS"
   [[ -n "$USE_BRANCH" ]] && echo "Branch:   $USE_BRANCH"
   [[ "$OPEN_PR" == "true" ]] && echo "Open PR:  Yes"
@@ -231,6 +239,7 @@ main() {
     
     # Export settings for parallel execution
     export MODEL
+    export REVIEW_MODEL
     export SKIP_MERGE
 
     # Parallel PR behavior: one integration branch + one PR

@@ -13,6 +13,7 @@ _RALPH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source the task parser for YAML backend support
 if [[ -f "$_RALPH_SCRIPT_DIR/task-parser.sh" ]]; then
+  # shellcheck source=scripts/task-parser.sh
   source "$_RALPH_SCRIPT_DIR/task-parser.sh"
   _TASK_PARSER_AVAILABLE=1
 else
@@ -29,15 +30,20 @@ ROTATE_THRESHOLD="${ROTATE_THRESHOLD:-80000}"
 
 # Iteration limits
 MAX_ITERATIONS="${MAX_ITERATIONS:-20}"
+ITERATION_TIMEOUT_SECONDS="${ITERATION_TIMEOUT_SECONDS:-600}"
 
 # Model selection
-DEFAULT_MODEL="opus-4.5-thinking"
+DEFAULT_MODEL="opus-4.6-thinking"
 MODEL="${RALPH_MODEL:-$DEFAULT_MODEL}"
+REVIEW_MODEL="${RALPH_REVIEW_MODEL:-}"
+MAX_REVIEW_ATTEMPTS="${MAX_REVIEW_ATTEMPTS:-2}"
 
 # Feature flags (set by caller)
 USE_BRANCH="${USE_BRANCH:-}"
 OPEN_PR="${OPEN_PR:-false}"
 SKIP_CONFIRM="${SKIP_CONFIRM:-false}"
+MIN_DISK_MB="${MIN_DISK_MB:-100}"
+MIN_MEMORY_MB="${MIN_MEMORY_MB:-500}"
 
 # =============================================================================
 # SOURCE RETRY UTILITIES
@@ -46,6 +52,7 @@ SKIP_CONFIRM="${SKIP_CONFIRM:-false}"
 # Source retry logic utilities
 SCRIPT_DIR="${SCRIPT_DIR:-$(dirname "${BASH_SOURCE[0]}")}"
 if [[ -f "$SCRIPT_DIR/ralph-retry.sh" ]]; then
+  # shellcheck source=scripts/ralph-retry.sh
   source "$SCRIPT_DIR/ralph-retry.sh"
 fi
 
@@ -93,7 +100,8 @@ set_iteration() {
 # Increment iteration and return new value
 increment_iteration() {
   local workspace="${1:-.}"
-  local current=$(get_iteration "$workspace")
+  local current
+  current=$(get_iteration "$workspace")
   local next=$((current + 1))
   set_iteration "$workspace" "$next"
   echo "$next"
@@ -122,7 +130,8 @@ log_activity() {
   local workspace="${1:-.}"
   local message="$2"
   local ralph_dir="$workspace/.ralph"
-  local timestamp=$(date '+%H:%M:%S')
+  local timestamp
+  timestamp=$(date '+%H:%M:%S')
   
   mkdir -p "$ralph_dir"
   echo "[$timestamp] $message" >> "$ralph_dir/activity.log"
@@ -133,7 +142,8 @@ log_error() {
   local workspace="${1:-.}"
   local message="$2"
   local ralph_dir="$workspace/.ralph"
-  local timestamp=$(date '+%H:%M:%S')
+  local timestamp
+  timestamp=$(date '+%H:%M:%S')
   
   mkdir -p "$ralph_dir"
   echo "[$timestamp] $message" >> "$ralph_dir/errors.log"
@@ -143,12 +153,15 @@ log_error() {
 log_progress() {
   local workspace="$1"
   local message="$2"
-  local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
   local progress_file="$workspace/.ralph/progress.md"
   
-  echo "" >> "$progress_file"
-  echo "### $timestamp" >> "$progress_file"
-  echo "$message" >> "$progress_file"
+  {
+    echo ""
+    echo "### $timestamp"
+    echo "$message"
+  } >> "$progress_file"
 }
 
 # =============================================================================
@@ -362,6 +375,90 @@ list_all_tasks() {
   fi
 }
 
+# List unique non-empty step-level models from RALPH_TASK.md
+list_task_models() {
+  local workspace="${1:-.}"
+
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -eq 1 ]]; then
+    get_all_tasks_with_group "$workspace" 2>/dev/null | while IFS='|' read -r task_id task_status task_group task_model task_desc; do
+      if [[ -n "$task_model" ]]; then
+        echo "$task_model"
+      fi
+    done | awk 'NF' | sort -u
+  else
+    local task_file="$workspace/RALPH_TASK.md"
+    if [[ -f "$task_file" ]]; then
+      sed -nE 's/.*<!--[[:space:]]*model:[[:space:]]*([^>]+)[[:space:]]*-->.*/\1/p' "$task_file" | awk 'NF' | sort -u
+    fi
+  fi
+}
+
+# Check if a model exists in cursor-agent --list-models output.
+# Matches either exact line or first column ("id - Display Name" format).
+is_model_in_list() {
+  local model_list="$1"
+  local model_name="$2"
+
+  printf "%s\n" "$model_list" | awk -v m="$model_name" '
+    { sub(/^[ \t]+/, ""); }
+    $1 == m || $0 == m { found = 1 }
+    END { exit !found }
+  '
+}
+
+# Track once-per-run warnings for invalid step model annotations.
+has_warned_step_model() {
+  local model_name="$1"
+  [[ "${RALPH_WARNED_STEP_MODELS:-}" == *$'\n'"$model_name"$'\n'* ]]
+}
+
+mark_warned_step_model() {
+  local model_name="$1"
+  RALPH_WARNED_STEP_MODELS="${RALPH_WARNED_STEP_MODELS:-$'\n'}${model_name}"$'\n'
+}
+
+# Resolve model for current iteration:
+# step-level annotation (next pending task) > global MODEL
+resolve_model() {
+  local workspace="${1:-.}"
+  local resolved_model="$MODEL"
+  local next_task task_id step_model
+
+  if [[ "${_TASK_PARSER_AVAILABLE:-0}" -ne 1 ]]; then
+    echo "$resolved_model"
+    return
+  fi
+
+  next_task=$(get_next_task_info "$workspace" 2>/dev/null || true)
+  task_id="${next_task%%|*}"
+  if [[ -z "$task_id" ]] || [[ "$task_id" == "$next_task" ]]; then
+    echo "$resolved_model"
+    return
+  fi
+
+  step_model=$(get_task_model "$workspace" "$task_id" 2>/dev/null || true)
+  if [[ -z "$step_model" ]]; then
+    echo "$resolved_model"
+    return
+  fi
+
+  # If prerequisites captured model list, validate step model dynamically.
+  # Unknown step model falls back to global MODEL.
+  if [[ -n "${RALPH_MODEL_LIST_CACHE:-}" ]] && ! is_model_in_list "$RALPH_MODEL_LIST_CACHE" "$step_model"; then
+    if ! has_warned_step_model "$step_model"; then
+      echo "⚠️  Step model '$step_model' on task '$task_id' not found; using '$resolved_model'." >&2
+      mark_warned_step_model "$step_model"
+    else
+      # Debug-level trace in activity log without repeating stderr warnings.
+      log_activity "$workspace" "DEBUG MODEL_FALLBACK: task=$task_id step_model=$step_model fallback=$resolved_model"
+    fi
+    echo "$resolved_model"
+    return
+  fi
+
+  echo "$step_model"
+}
+
 # Refresh task cache (useful after external edits)
 refresh_task_cache() {
   local workspace="${1:-.}"
@@ -381,9 +478,11 @@ refresh_task_cache() {
 build_prompt() {
   local workspace="$1"
   local iteration="$2"
+  local active_model="${3:-$MODEL}"
   
   cat << EOF
 # Ralph Iteration $iteration
+Model: $active_model
 
 You are an autonomous development agent using the Ralph methodology.
 
@@ -394,6 +493,7 @@ Before doing anything:
 2. Read \`.ralph/guardrails.md\` - lessons from past failures (FOLLOW THESE)
 3. Read \`.ralph/progress.md\` - what's been accomplished
 4. Read \`.ralph/errors.log\` - recent failures to avoid
+5. Read \`.ralph/review.md\` - review feedback from the review model (if present)
 
 ## Working Directory (Critical)
 
@@ -456,6 +556,77 @@ Begin by reading the state files.
 EOF
 }
 
+# Build prompt for optional review model pass
+build_review_prompt() {
+  local workspace="$1"
+  local iteration="$2"
+  local execution_model="$3"
+  local review_model="$4"
+  local checkpoint_file="$workspace/.ralph/last_checkpoint"
+  local base_ref=""
+
+  if [[ -f "$checkpoint_file" ]]; then
+    base_ref=$(cat "$checkpoint_file" 2>/dev/null || true)
+  fi
+  if [[ -z "$base_ref" ]]; then
+    base_ref=$(git -C "$workspace" rev-parse HEAD~1 2>/dev/null || echo "HEAD")
+  fi
+
+  local diff_cmd=(git -C "$workspace" diff --no-color "$base_ref"..HEAD)
+  local stat_cmd=(git -C "$workspace" diff --no-color --stat "$base_ref"..HEAD)
+  local diff_content
+  local diff_stat
+  diff_content="$("${diff_cmd[@]}" 2>/dev/null || true)"
+  diff_stat="$("${stat_cmd[@]}" 2>/dev/null || true)"
+  # Cap diff to keep review prompt bounded.
+  local max_chars=18000
+  if [[ ${#diff_content} -gt $max_chars ]]; then
+    diff_content="${diff_content:0:$max_chars}
+
+[TRUNCATED: diff exceeded ${max_chars} chars]"
+  fi
+
+  cat << EOF
+# Ralph Review Iteration $iteration
+Execution model: $execution_model
+Review model: $review_model
+
+You are the independent reviewer for a completed Ralph iteration.
+
+Review goals:
+1. Verify changes satisfy \`RALPH_TASK.md\` success criteria.
+2. Identify correctness, safety, testing, or maintainability issues.
+3. Flag critical misses, regressions, or unchecked assumptions.
+4. Keep feedback concise and actionable.
+
+Required files to read:
+- \`RALPH_TASK.md\`
+- Relevant changed files from the diff
+- \`.ralph/progress.md\`
+- \`.ralph/guardrails.md\`
+
+Git diff base: $base_ref
+
+## Diff summary
+$diff_stat
+
+## Diff content
+\`\`\`
+$diff_content
+\`\`\`
+
+Output format requirements:
+- Start with one sigil line:
+  - \`<ralph>REVIEW_PASS</ralph>\` if ready to ship
+  - \`<ralph>REVIEW_FAIL</ralph>\` if more work is needed
+- Then provide:
+  - \`## Findings\` with bullet points (or "No blocking issues.")
+  - \`## Recommended next actions\` with concrete steps
+
+Be strict on correctness and tests. Do not rewrite code; review only.
+EOF
+}
+
 # =============================================================================
 # SPINNER
 # =============================================================================
@@ -483,13 +654,64 @@ run_iteration() {
   local iteration="$2"
   local session_id="${3:-}"
   local script_dir="${4:-$(dirname "${BASH_SOURCE[0]}")}"
+  local iteration_model
+  iteration_model=$(resolve_model "$workspace")
   
-  local prompt=$(build_prompt "$workspace" "$iteration")
-  local fifo="$workspace/.ralph/.parser_fifo"
+  local prompt
+  prompt=$(build_prompt "$workspace" "$iteration" "$iteration_model")
+  local fifo="$workspace/.ralph/.parser_fifo_${iteration}_$$"
+  local stream_fifo="$workspace/.ralph/.agent_stream_fifo_${iteration}_$$"
+  local spinner_pid=""
+  local agent_pid=""
+  local agent_pgid=""
+  local parser_pid=""
+  local signal=""
+  local cleaned_up=0
   
-  # Create named pipe for parser signals
-  rm -f "$fifo"
+  # Cleanup must run on normal return and on signals.
+  _cleanup_iteration() {
+    if [[ "$cleaned_up" -eq 1 ]]; then
+      return
+    fi
+    cleaned_up=1
+    if [[ -n "$spinner_pid" ]]; then
+      kill "$spinner_pid" 2>/dev/null || true
+      wait "$spinner_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$agent_pid" ]]; then
+      if [[ -n "$agent_pgid" ]] && [[ "$agent_pgid" =~ ^[0-9]+$ ]]; then
+        local shell_pgid
+        shell_pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || echo "")
+        # Guard against accidentally targeting our own process group.
+        if [[ "$agent_pgid" != "$shell_pgid" ]]; then
+          kill -TERM -- "-$agent_pgid" 2>/dev/null || true
+          sleep 0.2
+          kill -KILL -- "-$agent_pgid" 2>/dev/null || true
+        fi
+      fi
+      kill "$agent_pid" 2>/dev/null || true
+      local child_pids
+      child_pids=$(pgrep -P "$agent_pid" 2>/dev/null || true)
+      if [[ -n "$child_pids" ]]; then
+        while IFS= read -r child; do
+          kill "$child" 2>/dev/null || true
+        done <<< "$child_pids"
+      fi
+      wait "$agent_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$parser_pid" ]]; then
+      kill "$parser_pid" 2>/dev/null || true
+      wait "$parser_pid" 2>/dev/null || true
+    fi
+    rm -f "$fifo" "$stream_fifo"
+    printf "\r\033[K" >&2
+  }
+  trap '_cleanup_iteration' INT TERM HUP EXIT
+  
+  # Create named pipe for parser signals (unique per iteration to avoid race).
+  rm -f "$fifo" "$stream_fifo"
   mkfifo "$fifo"
+  mkfifo "$stream_fifo"
   
   # Use stderr for display (stdout is captured for signal)
   echo "" >&2
@@ -498,85 +720,175 @@ run_iteration() {
   echo "═══════════════════════════════════════════════════════════════════" >&2
   echo "" >&2
   echo "Workspace: $workspace" >&2
-  echo "Model:     $MODEL" >&2
+  echo "Model:     $iteration_model" >&2
   echo "Monitor:   tail -f $workspace/.ralph/activity.log" >&2
   echo "" >&2
   
   # Log session start to progress.md
-  log_progress "$workspace" "**Session $iteration started** (model: $MODEL)"
+  log_progress "$workspace" "**Session $iteration started** (model: $iteration_model)"
   
   # Build cursor-agent command
-  local cmd="cursor-agent -p --force --output-format stream-json --model $MODEL"
-  
+  local cmd=(cursor-agent -p --force --output-format stream-json --model "$iteration_model")
   if [[ -n "$session_id" ]]; then
     echo "Resuming session: $session_id" >&2
-    cmd="$cmd --resume=\"$session_id\""
+    cmd+=(--resume "$session_id")
   fi
   
   # Change to workspace
-  cd "$workspace"
+  cd "$workspace" || return 1
   
   # Start spinner to show we're alive
   spinner "$workspace" &
   local spinner_pid=$!
   
-  # Start parser in background, reading from cursor-agent
-  # Parser outputs to fifo, we read signals from fifo
-  (
-    eval "$cmd \"$prompt\"" 2>&1 | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
-  ) &
-  local agent_pid=$!
+  # Start parser first so cursor-agent has an active consumer for streamed output.
+  "$script_dir/stream-parser.sh" "$workspace" < "$stream_fifo" > "$fifo" &
+  parser_pid=$!
+
+  # Launch cursor-agent writer. Prefer setsid so the agent gets a dedicated
+  # process group that can be terminated as a unit.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${cmd[@]}" "$prompt" > "$stream_fifo" 2>&1 &
+  else
+    "${cmd[@]}" "$prompt" > "$stream_fifo" 2>&1 &
+  fi
+  agent_pid=$!
+  agent_pgid=$(ps -o pgid= -p "$agent_pid" 2>/dev/null | tr -d ' ' || echo "")
   
   # Read signals from parser
-  local signal=""
-  while IFS= read -r line; do
-    case "$line" in
-      "ROTATE")
-        printf "\r\033[K" >&2  # Clear spinner line
-        echo "🔄 Context rotation triggered - stopping agent..." >&2
-        kill $agent_pid 2>/dev/null || true
-        signal="ROTATE"
+  local last_activity_ts now
+  last_activity_ts=$(date +%s)
+  while true; do
+    if IFS= read -r -t 1 line < "$fifo"; then
+      last_activity_ts=$(date +%s)
+      case "$line" in
+        "ROTATE")
+          printf "\r\033[K" >&2  # Clear spinner line
+          echo "🔄 Context rotation triggered - stopping agent..." >&2
+          kill "$agent_pid" 2>/dev/null || true
+          signal="ROTATE"
+          break
+          ;;
+        "WARN")
+          printf "\r\033[K" >&2  # Clear spinner line
+          echo "⚠️  Context warning - agent should wrap up soon..." >&2
+          # Send interrupt to encourage wrap-up (agent continues but is notified)
+          ;;
+        "GUTTER")
+          printf "\r\033[K" >&2  # Clear spinner line
+          echo "🚨 Gutter detected - agent may be stuck..." >&2
+          signal="GUTTER"
+          # Don't kill yet, let agent try to recover
+          ;;
+        "COMPLETE")
+          printf "\r\033[K" >&2  # Clear spinner line
+          echo "✅ Agent signaled completion!" >&2
+          signal="COMPLETE"
+          # Let agent finish gracefully
+          ;;
+        "DEFER")
+          printf "\r\033[K" >&2  # Clear spinner line
+          echo "⏸️  Rate limit or transient error - deferring for retry..." >&2
+          signal="DEFER"
+          # Stop the agent, will retry with backoff
+          kill "$agent_pid" 2>/dev/null || true
+          break
+          ;;
+        "NO_ACTIVITY")
+          printf "\r\033[K" >&2
+          echo "🚨 No activity detected (zero tool calls)." >&2
+          signal="NO_ACTIVITY"
+          break
+          ;;
+      esac
+    else
+      # read timed out or stream ended
+      if ! kill -0 "$agent_pid" 2>/dev/null; then
         break
-        ;;
-      "WARN")
-        printf "\r\033[K" >&2  # Clear spinner line
-        echo "⚠️  Context warning - agent should wrap up soon..." >&2
-        # Send interrupt to encourage wrap-up (agent continues but is notified)
-        ;;
-      "GUTTER")
-        printf "\r\033[K" >&2  # Clear spinner line
-        echo "🚨 Gutter detected - agent may be stuck..." >&2
-        signal="GUTTER"
-        # Don't kill yet, let agent try to recover
-        ;;
-      "COMPLETE")
-        printf "\r\033[K" >&2  # Clear spinner line
-        echo "✅ Agent signaled completion!" >&2
-        signal="COMPLETE"
-        # Let agent finish gracefully
-        ;;
-      "DEFER")
-        printf "\r\033[K" >&2  # Clear spinner line
-        echo "⏸️  Rate limit or transient error - deferring for retry..." >&2
-        signal="DEFER"
-        # Stop the agent, will retry with backoff
-        kill $agent_pid 2>/dev/null || true
-        ;;
-    esac
-  done < "$fifo"
+      fi
+      now=$(date +%s)
+      if [[ "$ITERATION_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && [[ "$ITERATION_TIMEOUT_SECONDS" -gt 0 ]] && [[ $((now - last_activity_ts)) -ge "$ITERATION_TIMEOUT_SECONDS" ]]; then
+        printf "\r\033[K" >&2
+        echo "⏱️  Iteration timeout (${ITERATION_TIMEOUT_SECONDS}s inactivity) - rotating context..." >&2
+        signal="TIMEOUT"
+        kill "$agent_pid" 2>/dev/null || true
+        break
+      fi
+    fi
+  done
   
   # Wait for agent to finish
-  wait $agent_pid 2>/dev/null || true
+  wait "$agent_pid" 2>/dev/null || true
   
-  # Stop spinner and clear line
-  kill $spinner_pid 2>/dev/null || true
-  wait $spinner_pid 2>/dev/null || true
-  printf "\r\033[K" >&2  # Clear spinner line
-  
-  # Cleanup
-  rm -f "$fifo"
-  
+  _cleanup_iteration
+  trap - INT TERM HUP EXIT
   echo "$signal"
+}
+
+# Run an optional review pass with REVIEW_MODEL.
+# Returns: PASS or FAIL
+run_review() {
+  local workspace="$1"
+  local iteration="$2"
+  local execution_model="$3"
+  local script_dir="${4:-$(dirname "${BASH_SOURCE[0]}")}"
+  local review_file="$workspace/.ralph/review.md"
+  local review_model="${REVIEW_MODEL:-}"
+
+  if [[ -z "$review_model" ]]; then
+    echo "PASS"
+    return 0
+  fi
+
+  mkdir -p "$workspace/.ralph"
+  : > "$review_file"
+
+  local prompt
+  prompt=$(build_review_prompt "$workspace" "$iteration" "$execution_model" "$review_model")
+
+  echo "" >&2
+  echo "🔍 Running review pass with model: $review_model" >&2
+
+  local review_json
+  local review_text=""
+  local cmd=(cursor-agent -p --force --output-format stream-json --model "$review_model")
+  review_json=$(
+    cd "$workspace" && "${cmd[@]}" "$prompt" 2>&1
+  ) || true
+
+  if [[ -n "$review_json" ]]; then
+    review_text=$(printf "%s\n" "$review_json" | jq -r '
+      select(.type == "assistant")
+      | .message.content[]?.text // empty
+    ' 2>/dev/null || true)
+  fi
+
+  if [[ -z "$review_text" ]]; then
+    review_text="Review model produced no structured assistant output.
+<ralph>REVIEW_FAIL</ralph>
+## Findings
+- Review output could not be parsed.
+## Recommended next actions
+- Re-run review or inspect recent commits manually."
+  fi
+
+  {
+    echo "# Review Feedback (Iteration $iteration)"
+    echo ""
+    echo "Execution model: \`$execution_model\`"
+    echo "Review model: \`$review_model\`"
+    echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    echo "$review_text"
+  } > "$review_file"
+
+  if [[ "$review_text" == *"<ralph>REVIEW_PASS</ralph>"* ]]; then
+    log_progress "$workspace" "**Review pass** - ✅ REVIEW_PASS ($review_model)"
+    echo "PASS"
+  else
+    log_progress "$workspace" "**Review pass** - ❌ REVIEW_FAIL ($review_model)"
+    echo "FAIL"
+  fi
 }
 
 # =============================================================================
@@ -589,14 +901,21 @@ run_iteration() {
 run_ralph_loop() {
   local workspace="$1"
   local script_dir="${2:-$(dirname "${BASH_SOURCE[0]}")}"
+  local review_attempt_count=0
   
   # Commit any uncommitted work first
-  cd "$workspace"
+  cd "$workspace" || return 1
   if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
     echo "📦 Committing uncommitted changes..."
     git add -A
     git commit -m "ralph: initial commit before loop" || true
   fi
+  
+  # Record a rollback checkpoint so users can safely undo loop changes.
+  mkdir -p "$workspace/.ralph"
+  git rev-parse HEAD > "$workspace/.ralph/last_checkpoint" 2>/dev/null || true
+  echo "🛟 Rollback checkpoint: $(cat "$workspace/.ralph/last_checkpoint" 2>/dev/null || echo "unknown")"
+  echo "   To roll back later: git reset --hard \$(cat .ralph/last_checkpoint)"
   
   # Create branch if requested
   if [[ -n "$USE_BRANCH" ]]; then
@@ -615,6 +934,8 @@ run_ralph_loop() {
   while [[ $iteration -le $MAX_ITERATIONS ]]; do
     # Run iteration
     local signal
+    local iteration_model
+    iteration_model=$(resolve_model "$workspace")
     signal=$(run_iteration "$workspace" "$iteration" "$session_id" "$script_dir")
     
     # Check task completion
@@ -622,6 +943,27 @@ run_ralph_loop() {
     task_status=$(check_task_complete "$workspace")
     
     if [[ "$task_status" == "COMPLETE" ]]; then
+      if [[ -n "$REVIEW_MODEL" ]]; then
+        local review_result
+        review_result=$(run_review "$workspace" "$iteration" "$iteration_model" "$script_dir")
+        if [[ "$review_result" != "PASS" ]]; then
+          review_attempt_count=$((review_attempt_count + 1))
+          if [[ $review_attempt_count -ge $MAX_REVIEW_ATTEMPTS ]]; then
+            log_progress "$workspace" "**Session $iteration ended** - ⚠️ REVIEW_FAIL max attempts reached"
+            echo ""
+            echo "⚠️  Review failed $review_attempt_count time(s)."
+            echo "   Max review attempts reached ($MAX_REVIEW_ATTEMPTS)."
+            echo "   Inspect .ralph/review.md and resolve manually."
+            return 1
+          fi
+          log_progress "$workspace" "**Session $iteration ended** - 🔁 REVIEW_FAIL, continuing iteration"
+          echo ""
+          echo "🔁 Review failed. Feedback written to .ralph/review.md."
+          echo "   Continuing with next iteration..."
+          continue
+        fi
+      fi
+      review_attempt_count=0
       log_progress "$workspace" "**Session $iteration ended** - ✅ TASK COMPLETE"
       echo ""
       echo "═══════════════════════════════════════════════════════════════════"
@@ -651,6 +993,27 @@ run_ralph_loop() {
       "COMPLETE")
         # Agent signaled completion - verify with checkbox check
         if [[ "$task_status" == "COMPLETE" ]]; then
+          if [[ -n "$REVIEW_MODEL" ]]; then
+            local review_result
+            review_result=$(run_review "$workspace" "$iteration" "$iteration_model" "$script_dir")
+            if [[ "$review_result" != "PASS" ]]; then
+              review_attempt_count=$((review_attempt_count + 1))
+              if [[ $review_attempt_count -ge $MAX_REVIEW_ATTEMPTS ]]; then
+                log_progress "$workspace" "**Session $iteration ended** - ⚠️ REVIEW_FAIL max attempts reached"
+                echo ""
+                echo "⚠️  Review failed $review_attempt_count time(s)."
+                echo "   Max review attempts reached ($MAX_REVIEW_ATTEMPTS)."
+                echo "   Inspect .ralph/review.md and resolve manually."
+                return 1
+              fi
+              log_progress "$workspace" "**Session $iteration ended** - 🔁 REVIEW_FAIL, continuing iteration"
+              echo ""
+              echo "🔁 Review failed. Feedback written to .ralph/review.md."
+              echo "   Continuing with next iteration..."
+              continue
+            fi
+          fi
+          review_attempt_count=0
           log_progress "$workspace" "**Session $iteration ended** - ✅ TASK COMPLETE (agent signaled)"
           echo ""
           echo "═══════════════════════════════════════════════════════════════════"
@@ -689,6 +1052,14 @@ run_ralph_loop() {
         iteration=$((iteration + 1))
         session_id=""
         ;;
+      "TIMEOUT")
+        log_progress "$workspace" "**Session $iteration ended** - ⏱️ TIMEOUT (${ITERATION_TIMEOUT_SECONDS}s inactivity)"
+        echo ""
+        echo "⏱️  Iteration timed out due to inactivity."
+        echo "   Rotating to a fresh context..."
+        iteration=$((iteration + 1))
+        session_id=""
+        ;;
       "GUTTER")
         log_progress "$workspace" "**Session $iteration ended** - 🚨 GUTTER (agent stuck)"
         echo ""
@@ -718,6 +1089,14 @@ run_ralph_loop() {
         
         # Don't increment iteration - retry the same task
         echo "   Resuming..."
+        review_attempt_count=0
+        ;;
+      "NO_ACTIVITY")
+        log_progress "$workspace" "**Session $iteration ended** - 🚨 NO_ACTIVITY (zero tool calls)"
+        echo ""
+        echo "🚨 No-op iteration detected (zero tool calls)."
+        echo "   Failing fast to avoid silent loops."
+        return 1
         ;;
       *)
         # Agent finished naturally, check if more work needed
@@ -728,6 +1107,7 @@ run_ralph_loop() {
           echo "📋 Agent finished but $remaining_count criteria remaining."
           echo "   Starting next iteration..."
           iteration=$((iteration + 1))
+          review_attempt_count=0
         fi
         ;;
     esac
@@ -784,6 +1164,53 @@ check_prerequisites() {
     echo "❌ Not a git repository"
     echo "   Ralph requires git for state persistence."
     return 1
+  fi
+
+  # Check available disk space (in MB, portable with POSIX df -Pm output).
+  local available_mb
+  available_mb=$(df -Pm "$workspace" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
+  if [[ "$available_mb" =~ ^[0-9]+$ ]] && [[ "$available_mb" -lt "$MIN_DISK_MB" ]]; then
+    echo "❌ Not enough free disk space (${available_mb}MB available, need ${MIN_DISK_MB}MB+)."
+    return 1
+  fi
+
+  # Check available memory (best effort, Darwin + Linux).
+  local available_mem_mb=0
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    local page_size free_pages
+    page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")
+    free_pages=$(vm_stat 2>/dev/null | awk '/Pages free/ {gsub("\\.","",$3); print $3}' || echo "0")
+    available_mem_mb=$(( (page_size * free_pages) / 1024 / 1024 ))
+  else
+    available_mem_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "0")
+  fi
+  if [[ "$available_mem_mb" =~ ^[0-9]+$ ]] && [[ "$available_mem_mb" -lt "$MIN_MEMORY_MB" ]]; then
+    echo "⚠️  Low available memory (${available_mem_mb}MB). Recommended ${MIN_MEMORY_MB}MB+."
+  fi
+
+  # Validate selected models when model listing is available.
+  # cursor-agent outputs "id - Display Name" (or "id" only); match first column or whole line.
+  local model_list
+  model_list=$(cursor-agent --list-models 2>&1 || true)
+  RALPH_MODEL_LIST_CACHE="$model_list"
+  if [[ -n "$model_list" ]]; then
+    if ! is_model_in_list "$model_list" "$MODEL"; then
+      echo "❌ Model '$MODEL' not found in cursor-agent --list-models output."
+      return 1
+    fi
+    if [[ -n "$REVIEW_MODEL" ]] && ! is_model_in_list "$model_list" "$REVIEW_MODEL"; then
+      echo "❌ Review model '$REVIEW_MODEL' not found in cursor-agent --list-models output."
+      return 1
+    fi
+
+    # Validate step-level models from task annotations.
+    local step_model
+    while IFS= read -r step_model; do
+      [[ -z "$step_model" ]] && continue
+      if ! is_model_in_list "$model_list" "$step_model"; then
+        echo "⚠️  Step model '$step_model' not found; those tasks will fall back to '$MODEL'."
+      fi
+    done < <(list_task_models "$workspace")
   fi
   
   return 0
