@@ -155,26 +155,6 @@ chmod +x .cursor/ralph-scripts/*.sh 2>/dev/null || true
 echo "✓ Scripts installed to .cursor/ralph-scripts/"
 
 # =============================================================================
-# UPDATE .gitignore
-# =============================================================================
-
-if [[ -f ".gitignore" ]]; then
-  # Don't gitignore .ralph/ - we want it tracked for state persistence
-  if ! grep -q "ralph-config.json" .gitignore; then
-    echo "" >> .gitignore
-    echo "# Ralph config (may contain API keys)" >> .gitignore
-    echo ".cursor/ralph-config.json" >> .gitignore
-  fi
-  echo "✓ Updated .gitignore"
-else
-  cat > .gitignore << 'EOF'
-# Ralph config (may contain API keys)
-.cursor/ralph-config.json
-EOF
-  echo "✓ Created .gitignore"
-fi
-
-# =============================================================================
 # SUMMARY
 # =============================================================================
 

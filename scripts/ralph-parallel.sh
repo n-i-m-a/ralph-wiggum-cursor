@@ -154,7 +154,8 @@ create_agent_worktree() {
     return 1
   fi
 
-  local branch_name="ralph/parallel-${RUN_ID}-${job_id}-${task_id}-$(slugify "$task_name")"
+  local branch_name
+  branch_name="ralph/parallel-${RUN_ID}-${job_id}-${task_id}-$(slugify "$task_name")"
   local worktree_dir="$worktree_base/${RUN_ID}-${job_id}"
   
   # Remove existing worktree dir if any
@@ -163,8 +164,12 @@ create_agent_worktree() {
     git -C "$original_dir" worktree prune 2>/dev/null || true
   fi
   
-  # Create worktree with new branch
-  git -C "$original_dir" worktree add -B "$branch_name" "$worktree_dir" "$BASE_SHA" >/dev/null 2>&1
+  # Create worktree with new branch.
+  # Do not suppress stderr here so callers can see the real failure reason.
+  if ! git -C "$original_dir" worktree add -B "$branch_name" "$worktree_dir" "$BASE_SHA"; then
+    echo "ERROR: Failed to create worktree '$worktree_dir' on branch '$branch_name'" >&2
+    return 1
+  fi
   
   echo "$worktree_dir|$branch_name"
 }
@@ -217,7 +222,7 @@ cleanup_all_worktrees() {
 
 # Run a single agent in its worktree
 # Uses globals: RUN_ID, BASE_SHA
-# Args: task_id, task_desc, display_agent_num, job_id, worktree_dir, log_file, status_file, output_file
+# Args: task_id, task_desc, display_agent_num, job_id, worktree_dir, log_file, status_file, output_file, agent_model
 run_agent_in_worktree() {
   local task_id="$1"
   local task_desc="$2"
@@ -227,6 +232,7 @@ run_agent_in_worktree() {
   local log_file="$6"
   local status_file="$7"
   local output_file="$8"
+  local agent_model="${9:-$MODEL}"
   
   echo "running" > "$status_file"
   
@@ -278,7 +284,7 @@ Begin by reading any relevant files, then implement the task."
   
   # Headless mode: auto-approve MCP servers to avoid interactive prompts.
   # Also detach stdin to prevent any accidental blocking on input.
-  if cd "$worktree_dir" && cursor-agent -p --approve-mcps --force --output-format stream-json --model "$MODEL" "$prompt" >> "$log_file" 2>&1 < /dev/null; then
+  if cd "$worktree_dir" && cursor-agent -p --approve-mcps --force --output-format stream-json --model "$agent_model" "$prompt" >> "$log_file" 2>&1 < /dev/null; then
     echo "done" > "$status_file"
     
     # Check if any commits were made
@@ -461,8 +467,10 @@ run_parallel_tasks() {
     return 1
   fi
   
-  local worktree_base=$(get_worktree_base "$workspace")
-  local original_dir=$(cd "$workspace" && pwd)
+  local worktree_base
+  worktree_base=$(get_worktree_base "$workspace")
+  local original_dir
+  original_dir=$(cd "$workspace" && pwd)
   
   # =========================================================================
   # PREFLIGHT CHECK: Ensure RALPH_TASK.md is tracked
@@ -572,7 +580,6 @@ run_parallel_tasks() {
   local global_job_num=0
   
   # Track ALL successful items for final PR (across all groups)
-  local all_successful_items=()
   local all_merged_branches=()
   local all_integrated_task_ids=()
   
@@ -584,8 +591,8 @@ run_parallel_tasks() {
     
     # Get tasks for this group
     local tasks=()
-    while IFS='|' read -r id status group desc; do
-      tasks+=("$id|$desc")
+    while IFS='|' read -r id status _group model desc; do
+      tasks+=("$id|$model|$desc")
     done < <(get_tasks_by_group "$workspace" "$current_group")
     
     if [[ ${#tasks[@]} -eq 0 ]]; then
@@ -601,6 +608,32 @@ run_parallel_tasks() {
     echo "📦 Group $group_label: ${#tasks[@]} task(s)"
     echo "═══════════════════════════════════════════════════════════════════"
     echo ""
+
+    # Resolve group model: if all annotated models are identical, use it.
+    # If mixed or unset, fall back to global MODEL.
+    local group_model="$MODEL"
+    local first_annotated_model=""
+    local has_mixed_models="false"
+    local task_data task_rest task_model
+    for task_data in "${tasks[@]}"; do
+      task_rest="${task_data#*|}"
+      task_model="${task_rest%%|*}"
+      [[ -z "$task_model" ]] && continue
+      if [[ -z "$first_annotated_model" ]]; then
+        first_annotated_model="$task_model"
+      elif [[ "$task_model" != "$first_annotated_model" ]]; then
+        has_mixed_models="true"
+        break
+      fi
+    done
+    if [[ -n "$first_annotated_model" ]] && [[ "$has_mixed_models" == "false" ]]; then
+      group_model="$first_annotated_model"
+      echo "🤖 Group model: $group_model (from task annotations)"
+      echo ""
+    elif [[ "$has_mixed_models" == "true" ]]; then
+      echo "⚠️  Group has mixed step models; using global model: $MODEL"
+      echo ""
+    fi
     
     # Track successful branches for THIS GROUP's merge phase
     local successful_items=()
@@ -638,7 +671,8 @@ run_parallel_tasks() {
     for ((i = task_idx; i < batch_end; i++)); do
       local task_data="${tasks[$i]}"
       local task_id="${task_data%%|*}"
-      local task_desc="${task_data#*|}"
+      local task_rest="${task_data#*|}"
+      local task_desc="${task_rest#*|}"
       global_job_num=$((global_job_num + 1))
       local batch_slot=$((i - task_idx + 1))
       local job_id="job${global_job_num}"
@@ -647,9 +681,18 @@ run_parallel_tasks() {
       
       # Create worktree
       local wt_result
-      wt_result=$(create_agent_worktree "$task_id" "$task_desc" "$job_id" "$worktree_base" "$original_dir")
+      if ! wt_result=$(create_agent_worktree "$task_id" "$task_desc" "$job_id" "$worktree_base" "$original_dir"); then
+        echo ""
+        echo "❌ Failed to initialize worktree for task ${task_id} (job ${job_id}). Aborting parallel run." >&2
+        return 1
+      fi
       local worktree_dir="${wt_result%%|*}"
       local branch_name="${wt_result#*|}"
+      if [[ -z "$worktree_dir" ]] || [[ -z "$branch_name" ]] || [[ "$worktree_dir" == "$branch_name" ]]; then
+        echo ""
+        echo "❌ Invalid worktree metadata for task ${task_id} (job ${job_id}): '$wt_result'" >&2
+        return 1
+      fi
       
       # Predictable per-run files for status/logging
       local status_file="$RUN_DIR/${job_id}.status"
@@ -679,7 +722,7 @@ run_parallel_tasks() {
       
       # Start agent in background
       (
-        run_agent_in_worktree "$task_id" "$task_desc" "$batch_slot" "$job_id" "$worktree_dir" "$log_file" "$status_file" "$output_file"
+        run_agent_in_worktree "$task_id" "$task_desc" "$batch_slot" "$job_id" "$worktree_dir" "$log_file" "$status_file" "$output_file" "$group_model"
       ) &
       pids+=($!)
     done
@@ -744,7 +787,7 @@ run_parallel_tasks() {
       local branch_name="${branch_names[$j]}"
       local worktree_dir="${worktree_dirs[$j]}"
       
-      local icon color
+      local icon
       case "$status" in
         "done")
           if [[ "$output_status" == "success" ]]; then
@@ -916,7 +959,7 @@ $commit_body"
   rm -f "$workspace/.ralph/$TASK_MTIME_FILE"
   parse_tasks "$workspace"
   local remaining
-  remaining=$(get_tasks_by_group "$workspace" "$current_group" | wc -l | tr -d ' ')
+  remaining=$(get_tasks_by_group "$workspace" "$current_group" | awk 'NF {c++} END {print c+0}')
   if [[ "$remaining" -gt 0 ]]; then
     echo ""
     echo "⚠️  Group $group_label still has $remaining pending task(s) after merge phase"
@@ -985,7 +1028,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   # Script is being run directly
   
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=scripts/ralph-common.sh
   source "$SCRIPT_DIR/ralph-common.sh"
+  # shellcheck source=scripts/task-parser.sh
   source "$SCRIPT_DIR/task-parser.sh"
   
   usage() {

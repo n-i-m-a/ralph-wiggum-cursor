@@ -1,10 +1,10 @@
 #!/bin/bash
 # Ralph Wiggum: One-click installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-cursor/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/n-i-m-a/ralph-wiggum-cursor/main/install.sh | bash
 
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-cursor/main"
+REPO_RAW="https://raw.githubusercontent.com/n-i-m-a/ralph-wiggum-cursor/main"
 
 echo "═══════════════════════════════════════════════════════════════════"
 echo "🐛 Ralph Wiggum Installer"
@@ -45,7 +45,7 @@ if ! command -v gum &> /dev/null; then
     if [[ "$OSTYPE" == "darwin"* ]]; then
       if command -v brew &> /dev/null; then
         echo "   Installing via Homebrew..."
-        brew install gum
+        brew install gum < /dev/null
       else
         echo "   ⚠️  Homebrew not found. Install manually: brew install gum"
       fi
@@ -70,8 +70,6 @@ gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
   fi
   echo ""
 fi
-
-WORKSPACE_ROOT="$(pwd)"
 
 # =============================================================================
 # CREATE DIRECTORIES
@@ -103,7 +101,9 @@ for script in "${SCRIPTS[@]}"; do
   if curl -fsSL "$REPO_RAW/scripts/$script" -o ".cursor/ralph-scripts/$script" 2>/dev/null; then
     chmod +x ".cursor/ralph-scripts/$script"
   else
-    echo "   ⚠️  Could not download $script (may not exist yet)"
+    echo "❌ Could not download required script: $script"
+    echo "   Aborting install to avoid partial/broken setup."
+    exit 1
   fi
 done
 
@@ -244,24 +244,6 @@ TASKEOF
 else
   echo "✓ RALPH_TASK.md already exists (not overwritten)"
 fi
-
-# =============================================================================
-# UPDATE .gitignore
-# =============================================================================
-
-if [[ -f ".gitignore" ]]; then
-  if ! grep -q "ralph-config.json" .gitignore 2>/dev/null; then
-    echo "" >> .gitignore
-    echo "# Ralph config (may contain API key)" >> .gitignore
-    echo ".cursor/ralph-config.json" >> .gitignore
-  fi
-else
-  cat > .gitignore <<'EOF'
-# Ralph config (may contain API key)
-.cursor/ralph-config.json
-EOF
-fi
-echo "✓ Updated .gitignore"
 
 # =============================================================================
 # SUMMARY

@@ -35,11 +35,15 @@ Ralph tracks state in files, NOT in context:
 
 ```
 .ralph/
-├── state.md           # Current iteration, task, completion criteria
-├── guardrails.md      # Accumulated "signs" from observed failures  
-├── context-log.md     # What's been loaded into context
-├── failures.md        # Failure patterns for learning
-└── progress.md        # What's been accomplished
+├── progress.md        # What's been accomplished (agent writes)
+├── guardrails.md      # Accumulated "signs" from observed failures (agent reads/writes)
+├── activity.log       # Tool call log with token counts (parser writes)
+├── errors.log         # Failures and gutter detection (parser writes)
+├── review.md          # Optional review-model feedback (review writes, agent reads)
+├── tasks.yaml         # Cached task state from RALPH_TASK.md (task-parser)
+├── tasks.mtime        # Cache invalidation for task file
+├── .iteration         # Current iteration number
+└── last_checkpoint    # Git ref for rollback (optional)
 ```
 
 ### The Iteration Cycle
@@ -75,6 +79,7 @@ Create a `RALPH_TASK.md` file in your project root:
 ```markdown
 ---
 task: Build a REST API for task management
+test_command: "pnpm test"
 completion_criteria:
   - All CRUD endpoints working
   - Input validation implemented
@@ -100,7 +105,18 @@ Build a task management API with the following endpoints:
 - Follow REST conventions
 ```
 
-Then tell Cursor: "Start a Ralph loop on this task"
+Run the loop via the Ralph scripts (install first with `install.sh`):
+
+```bash
+./.cursor/ralph-scripts/ralph-setup.sh   # Interactive: model, options, then run
+# Or CLI:
+./.cursor/ralph-scripts/ralph-once.sh    # Single iteration (human-in-the-loop)
+./.cursor/ralph-scripts/ralph-loop.sh -n 20 -y   # Full loop, non-interactive
+```
+
+Requires `cursor-agent` CLI and `jq`. See main README for prerequisites and examples.
+
+You can enable independent review with `--review-model MODEL` or `RALPH_REVIEW_MODEL=MODEL`.
 
 ### Monitoring Progress
 
@@ -151,16 +167,11 @@ Progress is in files and git, not in your head or the context.
 
 Don't hesitate to start fresh. State persists in files.
 
-## Integration with Cursor Hooks
+## How the Loop Runs
 
-This skill uses Cursor hooks for:
+Execution is **CLI-driven**: `ralph-setup.sh` / `ralph-loop.sh` invoke `cursor-agent` with streamed JSON output. `stream-parser.sh` parses the stream, tracks token usage, writes to `.ralph/activity.log` and `.ralph/errors.log`, and detects signals (ROTATE at 80k tokens, GUTTER, COMPLETE, DEFER). Completion is detected when all `[ ]` in RALPH_TASK.md are `[x]` or the agent outputs `<ralph>COMPLETE</ralph>`. Optional `--review-model` runs an independent second pass and writes findings to `.ralph/review.md`.
 
-- **beforeSubmitPrompt**: Inject guardrails and context awareness
-- **beforeReadFile**: Track context allocations
-- **afterFileEdit**: Update progress tracking
-- **stop**: Evaluate completion, trigger next iteration or fresh start
-
-See `scripts/` for hook implementations.
+See `scripts/` for the bash implementation; no Cursor IDE hooks are used.
 
 ## Learn More
 

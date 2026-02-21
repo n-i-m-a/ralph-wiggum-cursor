@@ -82,7 +82,9 @@ This creates two problems:
 |-------------|-------|---------------|
 | **Git repo** | `git status` works | `git init` |
 | **cursor-agent CLI** | `which cursor-agent` | `curl https://cursor.com/install -fsS \| bash` |
+| **jq** | `which jq` | `brew install jq` (macOS) or [jq downloads](https://jqlang.github.io/jq/download/) |
 | **gum** (optional) | `which gum` | Installer offers to install, or `brew install gum` |
+| **gh** (optional) | `which gh` | For `--pr` workflow: [GitHub CLI](https://cli.github.com/) |
 
 ## Quick Start
 
@@ -90,7 +92,7 @@ This creates two problems:
 
 ```bash
 cd your-project
-curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-cursor/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/n-i-m-a/ralph-wiggum-cursor/main/install.sh | bash
 ```
 
 This creates:
@@ -126,10 +128,10 @@ With gum, you get a beautiful interactive menu for selecting models and options:
 
 ```
 ? Select model:
-  ◉ opus-4.5-thinking
-  ◯ sonnet-4.5-thinking
-  ◯ gpt-5.2-high
-  ◯ composer-1
+  ◉ opus-4.6-thinking
+  ◯ sonnet-4.6-thinking
+  ◯ gpt-5.3-codex-high
+  ◯ composer-1.5
   ◯ Custom...
 
 ? Max iterations: 20
@@ -139,8 +141,11 @@ With gum, you get a beautiful interactive menu for selecting models and options:
   ◯ Run single iteration first
   ◯ Work on new branch
   ◯ Open PR when complete
+  ◯ Enable review model        ← optional second-pass review
   ◯ Run in parallel mode         ← runs multiple agents concurrently
 ```
+
+If you select "Enable review model", you'll be prompted to choose a second model that reviews completion before Ralph exits.
 
 If you select "Run in parallel mode", you'll be prompted for:
 
@@ -167,7 +172,7 @@ Build a REST API with user management.
 ## Success Criteria
 
 1. [ ] GET /health returns 200
-2. [ ] POST /users creates a user  
+2. [ ] POST /users creates a user <!-- model: opus-4.6-thinking -->
 3. [ ] GET /users/:id returns user
 4. [ ] All tests pass
 
@@ -209,6 +214,34 @@ tail -f .ralph/activity.log
 cat .ralph/errors.log
 ```
 
+## Examples
+
+Runnable examples live in the `examples/` directory. Use them to validate Ralph end-to-end without a heavy project.
+
+### Word Count E2E (`examples/wordcount-e2e/`)
+
+Minimal task: build a POSIX shell script that wraps `wc` and outputs JSON. No npm/TypeScript—good for a quick loop test.
+
+**Configure:**
+
+1. Create a clean workspace and copy the task file as `RALPH_TASK.md`:
+   ```bash
+   mkdir -p /tmp/ralph-test && cd /tmp/ralph-test
+   git init
+   cp /path/to/ralph/examples/wordcount-e2e/RALPH_TASK_WORDCOUNT_E2E.md RALPH_TASK.md
+   git add RALPH_TASK.md && git commit -m "init: wordcount e2e task"
+   ```
+2. Install Ralph into that directory (e.g. run `install.sh` from this repo or your fork).
+
+**Run:**
+
+- Single iteration (recommended first): from the ralph repo, `./scripts/ralph-once.sh /tmp/ralph-test`
+- Full loop: `./scripts/ralph-loop.sh -n 5 -y /tmp/ralph-test`
+
+**Verify:** `wc-wrap.sh` and `test.sh` appear; `bash test.sh` exits 0; `.ralph/progress.md` and activity log updated; all criteria in `RALPH_TASK.md` checked `[x]`.
+
+See `examples/wordcount-e2e/README.md` for full steps and what this exercises (task parser, completion detection, git, `.ralph/` state).
+
 ## Commands
 
 | Command | Description |
@@ -225,7 +258,8 @@ cat .ralph/errors.log
 
 Options:
   -n, --iterations N     Max iterations (default: 20)
-  -m, --model MODEL      Model to use (default: opus-4.5-thinking)
+  -m, --model MODEL      Model to use (default: opus-4.6-thinking)
+  --review-model MODEL   Optional review model (default: disabled)
   --branch NAME          Sequential: create/work on branch; Parallel: integration branch name
   --pr                   Sequential: open PR (requires --branch); Parallel: open ONE integration PR (branch optional)
   --parallel             Run tasks in parallel with worktrees
@@ -241,7 +275,10 @@ Options:
 ./ralph-loop.sh --branch feature/api --pr -y
 
 # Use a different model with more iterations
-./ralph-loop.sh -n 50 -m gpt-5.2-high
+./ralph-loop.sh -n 50 -m gpt-5.3-codex-high
+
+# Add an independent review model before exit
+./ralph-loop.sh -m gpt-5.3-codex-high --review-model sonnet-4.6-thinking
 
 # Run 4 agents in parallel
 ./ralph-loop.sh --parallel --max-parallel 4
@@ -405,6 +442,23 @@ Control execution order with `<!-- group: N -->` annotations:
 - All merges complete before next group starts
 - RALPH_TASK.md checkboxes updated per group
 
+### Per-Step Model Override
+
+You can override the model for an individual checkbox item:
+
+```markdown
+- [ ] Implement parser <!-- model: sonnet-4.6-thinking -->
+- [ ] Refactor architecture <!-- model: opus-4.6-thinking -->
+- [ ] Add docs  # no annotation = global model
+```
+
+**Resolution order:**
+1. Step-level annotation `<!-- model: ... -->`
+2. Global model from `--model` or `RALPH_MODEL`
+3. Built-in default model
+
+If a step model is not found in `cursor-agent --list-models`, Ralph warns and falls back to the global model.
+
 **Worktree structure:**
 ```
 project/
@@ -559,6 +613,21 @@ Ralph detects completion in two ways:
 
 Both are verified before declaring success.
 
+### Optional Review Model
+
+Enable an independent review pass with `--review-model` (or `RALPH_REVIEW_MODEL`). When enabled, after completion is detected Ralph asks a second model to review changes and writes output to `.ralph/review.md`.
+
+- If review outputs `<ralph>REVIEW_PASS</ralph>`, Ralph exits successfully
+- If review outputs `<ralph>REVIEW_FAIL</ralph>`, Ralph continues iterating and the next execution pass reads `.ralph/review.md`
+- Review attempts are capped by `MAX_REVIEW_ATTEMPTS` (default: `2`)
+
+Example review-fail loop output:
+```text
+🔍 Running review pass with model: sonnet-4.6-thinking
+🔁 Review failed. Feedback written to .ralph/review.md.
+   Continuing with next iteration...
+```
+
 ## File Reference
 
 | File | Purpose | Who Uses It |
@@ -568,9 +637,11 @@ Both are verified before declaring success.
 | `.ralph/guardrails.md` | Lessons learned (Signs) | Agent reads first, writes after failures |
 | `.ralph/activity.log` | Tool call log with token counts | Parser writes, you monitor |
 | `.ralph/errors.log` | Failures + gutter detection | Parser writes, agent reads |
+| `.ralph/review.md` | Review-model findings (optional) | Review model writes, execution model reads |
 | `.ralph/tasks.yaml` | Cached task state (auto-generated) | Task parser writes/reads |
 | `.ralph/tasks.mtime` | Task file modification time | Cache invalidation |
 | `.ralph/.iteration` | Current iteration number | Parser reads/writes |
+| `.ralph/last_checkpoint` | Git ref for rollback (optional) | Created at loop start |
 
 ## Configuration
 
@@ -578,10 +649,10 @@ Configuration is set via command-line flags or environment variables:
 
 ```bash
 # Via flags (recommended)
-./ralph-loop.sh -n 50 -m gpt-5.2-high
+./ralph-loop.sh -n 50 -m gpt-5.3-codex-high
 
 # Via environment
-RALPH_MODEL=gpt-5.2-high MAX_ITERATIONS=50 ./ralph-loop.sh
+RALPH_MODEL=gpt-5.3-codex-high RALPH_REVIEW_MODEL=sonnet-4.6-thinking MAX_ITERATIONS=50 ./ralph-loop.sh
 ```
 
 Default thresholds in `ralph-common.sh`:
@@ -591,6 +662,31 @@ MAX_ITERATIONS=20       # Max rotations before giving up
 WARN_THRESHOLD=70000    # Tokens: send wrapup warning
 ROTATE_THRESHOLD=80000  # Tokens: force rotation
 ```
+
+### Stability pre-flight checks
+
+Before each run, Ralph now performs:
+
+- git repository validation
+- disk-space validation (`MIN_DISK_MB`, default `100`)
+- memory sanity check (`MIN_MEMORY_MB`, default `500`, warning-only)
+- model validation against `cursor-agent --list-models` when available
+
+It also records a rollback checkpoint in `.ralph/last_checkpoint` at loop start.
+
+### Reliability KPIs (recommended)
+
+Track these in CI or run logs to validate stability improvements:
+
+- process cleanup success rate (no orphaned agent/spinner processes)
+- no-op detection rate (`NO_ACTIVITY` events)
+- mean successful iterations before failure
+- auto-retry recovery rate for transient API errors
+- CI pass rate (`shellcheck` + `bats`) per PR
+
+### Refactor policy (stability-first)
+
+Defer large script/module refactors until the CI suite is consistently green and critical runtime paths are covered by tests.
 
 ## Troubleshooting
 
